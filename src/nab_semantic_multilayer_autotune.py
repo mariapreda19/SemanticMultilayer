@@ -1,37 +1,25 @@
+import argparse
+import copy
+import itertools
 import json
 import os
 import random
+import zipfile
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-from scipy.signal import periodogram, find_peaks
-from scipy.ndimage import gaussian_filter1d
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, IsolationForest
+from scipy.ndimage import gaussian_filter1d, binary_closing, binary_opening
+from scipy.signal import periodogram
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    precision_recall_fscore_support,
-    roc_auc_score,
-    average_precision_score,
-    confusion_matrix,
-    classification_report,
-)
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.pipeline import make_pipeline
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, average_precision_score
+from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.preprocessing import RobustScaler, StandardScaler
-from sklearn.svm import OneClassSVM
-
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torch.utils.data import DataLoader, TensorDataset
-    TORCH_AVAILABLE = True
-except Exception:
-    TORCH_AVAILABLE = False
+from sklearn.pipeline import make_pipeline
+from sklearn.utils.class_weight import compute_sample_weight
 
 try:
     from tqdm.auto import tqdm
@@ -39,1264 +27,1122 @@ except Exception:
     def tqdm(x, **kwargs):
         return x
 
+
+
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
-    if TORCH_AVAILABLE:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-
-def choose_torch_device(device_setting: str = "auto"):
-    if not TORCH_AVAILABLE:
-        return None
-
-    if device_setting != "auto":
-        return torch.device(device_setting)
-
-    if torch.cuda.is_available():
-        try:
-            dev = torch.device("cuda")
-            _ = torch.randn(4, device=dev) * 2.0
-            torch.cuda.synchronize()
-            return dev
-        except Exception as e:
-            print(f"CUDA detected, but not usable by this PyTorch build. Using CPU instead. Details: {e}")
-            return torch.device("cpu")
-
-    return torch.device("cpu")
 
 
 
-def read_table_auto(path: str) -> pd.DataFrame:
-    if path.lower().endswith((".txt", ".tsv")):
-        return pd.read_csv(path, sep=r"\s+", header=None, engine="python")
-    if path.lower().endswith(".csv"):
-        return pd.read_csv(path, header=None)
-    try:
-        return pd.read_csv(path, sep=r"\s+", header=None, engine="python")
-    except Exception:
-        return pd.read_csv(path, header=None)
+def _norm_key(path: str) -> str:
+    return str(path).replace("\\", "/").lstrip("/")
 
 
-def table_to_X_y(df: pd.DataFrame, label_position: str, normal_label: int):
-    arr = df.apply(pd.to_numeric, errors="coerce").dropna().to_numpy(dtype=np.float32)
-    if label_position == "first":
-        y_raw = arr[:, 0].astype(int)
-        X = arr[:, 1:]
-    elif label_position == "last":
-        y_raw = arr[:, -1].astype(int)
-        X = arr[:, :-1]
-    else:
-        raise ValueError("label_position must be first or last")
-    y = (y_raw != int(normal_label)).astype(int)
-    return X.astype(np.float32), y.astype(int), y_raw.astype(int)
+def _strip_prefix(path: str, prefix: str) -> str:
+    return path[len(prefix):] if path.startswith(prefix) else path
 
 
-def load_ecg_data(
-    train_path: str,
-    test_path: str,
-    csv_path: str,
-    label_position: str,
-    label_col,
-    normal_label: int,
-    test_size: float,
-    seed: int,
-):
-    if train_path and test_path:
-        train_df = read_table_auto(train_path)
-        test_df = read_table_auto(test_path)
+def list_series(data_path: str) -> List[str]:
+    p = Path(data_path)
+    out = []
+    if p.is_dir():
+        roots = [p]
+        if (p / "data").is_dir():
+            roots.append(p / "data")
+        for root in roots:
+            for f in root.rglob("*.csv"):
+                rel = _norm_key(f.relative_to(root))
+                out.append(_strip_prefix(rel, "data/"))
+        return sorted(set(out))
+    if p.suffix.lower() == ".zip":
+        with zipfile.ZipFile(p, "r") as z:
+            for name in z.namelist():
+                name = _norm_key(name)
+                if name.endswith(".csv"):
+                    out.append(_strip_prefix(name, "data/"))
+        return sorted(set(out))
+    raise ValueError(f"data_path must be folder or .zip: {data_path}")
 
-        X_train, y_train, yraw_train = table_to_X_y(train_df, label_position, normal_label)
-        X_test, y_test, yraw_test = table_to_X_y(test_df, label_position, normal_label)
 
-        X_raw = np.vstack([X_train, X_test])
-        y = np.r_[y_train, y_test]
-        y_raw = np.r_[yraw_train, yraw_test]
+def load_csv(data_path: str, series_key: str) -> pd.DataFrame:
+    p = Path(data_path)
+    series_key = _norm_key(series_key)
 
-        train_idx = np.arange(len(X_train))
-        test_idx = np.arange(len(X_train), len(X_train) + len(X_test))
-        return X_raw, y, y_raw, train_idx, test_idx, "ucr_fixed_train_test"
-
-    if csv_path:
+    if p.is_dir():
+        candidates = [p / series_key, p / "data" / series_key]
+        csv_path = next((c for c in candidates if c.is_file()), None)
+        if csv_path is None:
+            examples = list_series(str(p))[:20]
+            raise FileNotFoundError(f"Nu gasesc seria {series_key}. Exemple:\n" + "\n".join(examples))
         df = pd.read_csv(csv_path)
-        if label_col == "auto":
-            label_col = df.columns[-1]
-        else:
-            try:
-                label_col = df.columns[int(label_col)]
-            except Exception:
-                pass
-
-        y_raw = pd.to_numeric(df[label_col], errors="coerce").astype(int).to_numpy()
-        feat_cols = [c for c in df.columns if c != label_col]
-        X_raw = df[feat_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
-
-        good = np.isfinite(X_raw).all(axis=1) & np.isfinite(y_raw)
-        X_raw, y_raw = X_raw[good], y_raw[good]
-
-        uniq = sorted(np.unique(y_raw).tolist())
-        if normal_label in uniq:
-            y = (y_raw != int(normal_label)).astype(int)
-        else:
-            mapping = {uniq[0]: 0, uniq[-1]: 1}
-            y = np.array([mapping[v] for v in y_raw], dtype=int)
-
-        train_idx, test_idx = train_test_split(
-            np.arange(len(y)),
-            test_size=test_size,
-            stratify=y,
-            random_state=seed,
-        )
-        return X_raw, y, y_raw, train_idx, test_idx, "csv_stratified_split"
-
-    raise ValueError("Trebuie setate fie train_path si test_path, fie csv_path.")
-
-
-
-def robust_normalize_train_test(X_train: np.ndarray, X_test: np.ndarray):
-    scaler = RobustScaler()
-    scaler.fit(X_train.reshape(-1, 1))
-    Xt = scaler.transform(X_train.reshape(-1, 1)).reshape(X_train.shape).astype(np.float32)
-    Xv = scaler.transform(X_test.reshape(-1, 1)).reshape(X_test.shape).astype(np.float32)
-    return Xt, Xv, scaler
-
-
-def per_sample_center_scale(X: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    med = np.median(X, axis=1, keepdims=True)
-    mad = np.median(np.abs(X - med), axis=1, keepdims=True) + eps
-    return ((X - med) / mad).astype(np.float32)
-
-
-def z_norm_segment(seg: np.ndarray, eps: float = 1e-6):
-    return (seg - np.mean(seg)) / (np.std(seg) + eps)
-
-def spectral_features(x: np.ndarray) -> Dict[str, float]:
-    freqs, psd = periodogram(x)
-    psd = np.maximum(psd, 1e-12)
-    psd_norm = psd / psd.sum()
-    entropy = -float(np.sum(psd_norm * np.log(psd_norm)))
-    centroid = float(np.sum(freqs * psd_norm))
-    q35, q65, q85 = np.quantile(freqs, [0.35, 0.65, 0.85]) if len(freqs) > 4 else (0, 0, 0)
-    return {
-        "freq_entropy": entropy,
-        "freq_centroid": centroid,
-        "freq_high_ratio": float(psd[freqs > q65].sum() / psd.sum()) if len(freqs) > 4 else 0.0,
-        "freq_low_ratio": float(psd[freqs <= q35].sum() / psd.sum()) if len(freqs) > 4 else 0.0,
-        "freq_very_high_ratio": float(psd[freqs > q85].sum() / psd.sum()) if len(freqs) > 4 else 0.0,
-    }
-
-
-def morphology_features(x: np.ndarray) -> Dict[str, float]:
-    dx = np.diff(x)
-    ddx = np.diff(dx)
-    peaks, _ = find_peaks(x, distance=4)
-    troughs, _ = find_peaks(-x, distance=4)
-
-    if len(peaks) > 0:
-        peak_vals = x[peaks]
-        main_peak_idx = int(peaks[np.argmax(peak_vals)])
-        main_peak_pos = float(main_peak_idx / max(len(x) - 1, 1))
-        main_peak_val = float(np.max(peak_vals))
+    elif p.suffix.lower() == ".zip":
+        candidates = ["data/" + series_key, series_key]
+        with zipfile.ZipFile(p, "r") as z:
+            names = set(_norm_key(n) for n in z.namelist())
+            internal = next((c for c in candidates if c in names), None)
+            if internal is None:
+                examples = [n for n in names if n.endswith(".csv")][:20]
+                raise FileNotFoundError(f"Nu gasesc seria {series_key}. Exemple:\n" + "\n".join(examples))
+            with z.open(internal) as f:
+                df = pd.read_csv(f)
     else:
-        main_peak_idx = int(np.argmax(x))
-        main_peak_pos = float(main_peak_idx / max(len(x) - 1, 1))
-        main_peak_val = float(np.max(x))
+        raise ValueError(f"data_path must be folder or .zip: {data_path}")
 
-    if len(troughs) > 0:
-        trough_vals = x[troughs]
-        main_trough_idx = int(troughs[np.argmin(trough_vals)])
-        main_trough_val = float(np.min(trough_vals))
-    else:
-        main_trough_idx = int(np.argmin(x))
-        main_trough_val = float(np.min(x))
+    if "timestamp" not in df.columns or "value" not in df.columns:
+        raise ValueError(f"{series_key} nu are timestamp,value. Coloane: {list(df.columns)}")
 
-    amp = float(np.max(x) - np.min(x))
-    energy = float(np.mean(x ** 2))
-    slope_energy = float(np.mean(dx ** 2)) if len(dx) else 0.0
-    curvature_energy = float(np.mean(ddx ** 2)) if len(ddx) else 0.0
-
-    peak_trough_distance = abs(main_peak_idx - main_trough_idx) / max(len(x) - 1, 1)
-    zero_crossings = float(np.sum(np.diff(np.signbit(x)).astype(int)))
-    slope_zero_crossings = float(np.sum(np.diff(np.signbit(dx)).astype(int))) if len(dx) else 0.0
-
-    return {
-        "amp_range": amp,
-        "energy": energy,
-        "mean_abs": float(np.mean(np.abs(x))),
-        "std": float(np.std(x)),
-        "skew_proxy": float(np.mean((x - np.mean(x)) ** 3) / (np.std(x) ** 3 + 1e-6)),
-        "kurt_proxy": float(np.mean((x - np.mean(x)) ** 4) / (np.std(x) ** 4 + 1e-6)),
-        "slope_energy": slope_energy,
-        "curvature_energy": curvature_energy,
-        "n_peaks": float(len(peaks)),
-        "n_troughs": float(len(troughs)),
-        "main_peak_pos": main_peak_pos,
-        "main_peak_val": main_peak_val,
-        "main_trough_val": main_trough_val,
-        "peak_to_trough": float(main_peak_val - main_trough_val),
-        "peak_trough_distance": float(peak_trough_distance),
-        "zero_crossings": zero_crossings,
-        "slope_zero_crossings": slope_zero_crossings,
-    }
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["value"]).reset_index(drop=True)
+    return df
 
 
-def window_morphology_features(x: np.ndarray, parts: int = 5) -> Dict[str, float]:
-    out = {}
-    chunks = np.array_split(x, parts)
-    for i, c in enumerate(chunks):
-        out[f"part{i}_mean"] = float(np.mean(c))
-        out[f"part{i}_std"] = float(np.std(c))
-        out[f"part{i}_energy"] = float(np.mean(c ** 2))
-        out[f"part{i}_max"] = float(np.max(c))
-        out[f"part{i}_min"] = float(np.min(c))
-        out[f"part{i}_range"] = float(np.max(c) - np.min(c))
-    return out
+def load_label_json(labels_path: str, filename: str) -> Dict:
+    p = Path(labels_path)
+    if p.is_dir():
+        candidates = [p / filename, p / "labels" / filename]
+        json_path = next((c for c in candidates if c.is_file()), None)
+        if json_path is None:
+            raise FileNotFoundError(f"Nu gasesc {filename} in {labels_path}")
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if p.suffix.lower() == ".zip":
+        candidates = ["labels/" + filename, filename]
+        with zipfile.ZipFile(p, "r") as z:
+            names = set(_norm_key(n) for n in z.namelist())
+            internal = next((c for c in candidates if c in names), None)
+            if internal is None:
+                raise FileNotFoundError(f"Nu gasesc {filename} in {labels_path}")
+            with z.open(internal) as f:
+                return json.load(f)
+    raise ValueError(f"labels_path must be folder or .zip: {labels_path}")
 
 
-def wavelet_like_features(x: np.ndarray, scales=(1, 2, 4, 8, 12)) -> Dict[str, float]:
-    out = {}
-    prev = x.astype(float)
-    total_energy = np.mean(x ** 2) + 1e-9
-    for s in scales:
-        smooth = gaussian_filter1d(x, sigma=s)
-        detail = prev - smooth
-        out[f"wavelet_detail_energy_s{s}"] = float(np.mean(detail ** 2))
-        out[f"wavelet_detail_ratio_s{s}"] = float(np.mean(detail ** 2) / total_energy)
-        out[f"wavelet_detail_max_s{s}"] = float(np.max(np.abs(detail)))
-        prev = smooth
-    out["wavelet_low_energy"] = float(np.mean(prev ** 2) / total_energy)
-    return out
+def labels_to_sparse_point_mask(df: pd.DataFrame, label_times: List[str]) -> np.ndarray:
+    label_ts = set(pd.to_datetime(label_times))
+    return df["timestamp"].isin(label_ts).astype(int).to_numpy()
 
 
-def build_statistical_feature_matrix(X: np.ndarray) -> Tuple[np.ndarray, List[str]]:
-    rows, names = [], None
-    for x in X:
-        d = {}
-        d.update(morphology_features(x))
-        d.update(spectral_features(x))
-        d.update(window_morphology_features(x, parts=5))
-        d.update(wavelet_like_features(x))
-        if names is None:
-            names = list(d.keys())
-        rows.append([d[k] for k in names])
-    return np.asarray(rows, dtype=np.float32), names
-
-
-def extract_random_shapelets(X: np.ndarray, y: np.ndarray, lengths: List[int], per_class: int, seed: int):
-    rng = np.random.default_rng(seed)
-    prototypes = []
-    labels = []
-    n, T = X.shape
-    for cls in [0, 1]:
-        idx = np.where(y == cls)[0]
-        if len(idx) == 0:
+def windows_to_point_mask(df: pd.DataFrame, windows: List[List[str]]) -> np.ndarray:
+    ts = df["timestamp"]
+    y = np.zeros(len(df), dtype=int)
+    for pair in windows:
+        if len(pair) != 2:
             continue
-        for L in lengths:
-            if L >= T:
-                continue
-            chosen = rng.choice(idx, size=min(per_class, len(idx)), replace=len(idx) < per_class)
-            for i in chosen:
-                start = int(rng.integers(0, T - L + 1))
-                proto = z_norm_segment(X[i, start:start+L])
-                prototypes.append(proto.astype(np.float32))
-                labels.append(cls)
-    return prototypes, np.array(labels, dtype=int)
+        a, b = pd.to_datetime(pair[0]), pd.to_datetime(pair[1])
+        y[((ts >= a) & (ts <= b)).to_numpy()] = 1
+    return y
 
 
-def min_subseq_dist(x: np.ndarray, proto: np.ndarray) -> float:
-    L = len(proto)
-    best = np.inf
-    for s in range(0, len(x) - L + 1):
-        seg = z_norm_segment(x[s:s+L])
-        d = np.sqrt(np.mean((seg - proto) ** 2))
-        if d < best:
-            best = d
-    return float(best)
+def mask_to_segments(mask: np.ndarray) -> List[Tuple[int, int]]:
+    mask = np.asarray(mask).astype(int)
+    segs = []
+    i = 0
+    n = len(mask)
+    while i < n:
+        if mask[i] == 0:
+            i += 1
+            continue
+        j = i
+        while j < n and mask[j] == 1:
+            j += 1
+        segs.append((i, j - 1))
+        i = j
+    return segs
 
 
-def shapelet_response_features(X: np.ndarray, prototypes: List[np.ndarray], labels: np.ndarray):
-    if len(prototypes) == 0:
-        return np.zeros((len(X), 3), dtype=np.float32), ["shapelet_normal_min", "shapelet_abnormal_min", "shapelet_margin"]
-    rows = []
-    for x in tqdm(X, desc="Shapelet responses", leave=False):
-        dists = np.array([min_subseq_dist(x, p) for p in prototypes], dtype=np.float32)
-        dn = np.min(dists[labels == 0]) if np.any(labels == 0) else np.min(dists)
-        da = np.min(dists[labels == 1]) if np.any(labels == 1) else np.min(dists)
-        rows.append([dn, da, dn - da])
-    return np.asarray(rows, dtype=np.float32), ["shapelet_normal_min", "shapelet_abnormal_min", "shapelet_margin"]
+
+def parse_int_list(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
-class ECGAutoencoder(nn.Module):
-    def __init__(self, length=140, latent=16):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(length, 128), nn.ReLU(),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, latent),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent, 64), nn.ReLU(),
-            nn.Linear(64, 128), nn.ReLU(),
-            nn.Linear(128, length),
-        )
-
-    def forward(self, x):
-        z = self.encoder(x)
-        rec = self.decoder(z)
-        return rec, z
+def robust_z(values: np.ndarray, train_end: int, positive_only: bool = True) -> np.ndarray:
+    v = np.asarray(values, dtype=np.float64)
+    train_end = max(3, min(train_end, len(v)))
+    tr = v[:train_end]
+    med = np.nanmedian(tr)
+    mad = np.nanmedian(np.abs(tr - med)) + 1e-9
+    z = (v - med) / mad
+    z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.maximum(z, 0.0) if positive_only else np.abs(z)
 
 
-class ECGEmbeddingNet(nn.Module):
-    def __init__(self, length=140, latent=24):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(length, 128), nn.ReLU(), nn.Dropout(0.1),
-            nn.Linear(128, 64), nn.ReLU(),
-            nn.Linear(64, latent), nn.ReLU(),
-        )
-        self.head = nn.Linear(latent, 1)
+def robust_scale_signal(x_raw: np.ndarray, train_end: int, use_log: bool = True) -> np.ndarray:
+    x = np.asarray(x_raw, dtype=float)
+    x = np.nan_to_num(x, nan=np.nanmedian(x), posinf=np.nanmedian(x), neginf=np.nanmedian(x))
 
-    def forward(self, x):
-        z = self.encoder(x)
-        logit = self.head(z).squeeze(-1)
-        return logit, z
+    if use_log and np.nanmin(x) >= 0:
+        q99 = np.nanquantile(x[:train_end], 0.99)
+        q50 = np.nanquantile(x[:train_end], 0.50)
+        if q99 > 10 * max(abs(q50), 1e-6):
+            x = np.log1p(x)
+
+    scaler = RobustScaler().fit(x[:train_end].reshape(-1, 1))
+    y = scaler.transform(x.reshape(-1, 1)).ravel().astype(float)
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    return y
 
 
-def train_autoencoder(
-    X_train_normal: np.ndarray,
-    latent_dim: int,
-    learning_rate: float,
-    batch_size: int,
-    epochs: int,
-    device_setting: str,
-    masked: bool = False,
-    mask_ratio: float = 0.25,
-    denoise_noise: float = 0.03,
-):
-    if not TORCH_AVAILABLE:
-        return None
+def clean_mask(mask: np.ndarray, min_segment: int = 1, close_gap: int = 0) -> np.ndarray:
+    out = mask.astype(bool)
+    if close_gap and close_gap > 1:
+        out = binary_closing(out, structure=np.ones(close_gap)).astype(bool)
+    if min_segment and min_segment > 1:
+        out = binary_opening(out, structure=np.ones(min_segment)).astype(bool)
+    return out.astype(int)
 
-    device = choose_torch_device(device_setting)
-    model = ECGAutoencoder(X_train_normal.shape[1], latent_dim).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
 
-    loader = DataLoader(
-        TensorDataset(torch.tensor(X_train_normal, dtype=torch.float32)),
-        batch_size=batch_size,
-        shuffle=True,
+def expand_events(mask: np.ndarray, radius: int) -> np.ndarray:
+    mask = np.asarray(mask).astype(int)
+    if radius <= 0 or mask.sum() == 0:
+        return mask
+    out = np.zeros_like(mask)
+    idx = np.where(mask == 1)[0]
+    n = len(mask)
+    for i in idx:
+        a = max(0, i - radius)
+        b = min(n, i + radius + 1)
+        out[a:b] = 1
+    return out
+
+
+def choose_clean_train_prefix(y_window: np.ndarray, n: int, train_ratio: float, min_train: int, use_labels: bool) -> int:
+    default_end = min(max(min_train, int(n * train_ratio)), n - 1)
+    if not use_labels:
+        return default_end
+    idx = np.where(y_window == 1)[0]
+    if len(idx) == 0:
+        return default_end
+    first = int(idx[0])
+    if first > min_train:
+        return min(default_end, first - 1)
+    return default_end
+
+
+
+def rolling_stats(x: np.ndarray, w: int, causal: bool) -> Dict[str, np.ndarray]:
+    s = pd.Series(x)
+    minp = max(3, w // 4)
+    r = s.rolling(w, center=not causal, min_periods=minp)
+    out = {
+        "mean": r.mean(),
+        "median": r.median(),
+        "std": r.std(),
+        "min": r.min(),
+        "max": r.max(),
+        "q10": r.quantile(0.10),
+        "q25": r.quantile(0.25),
+        "q75": r.quantile(0.75),
+        "q90": r.quantile(0.90),
+    }
+    res = {}
+    for k, v in out.items():
+        res[k] = v.bfill().ffill().fillna(0.0).to_numpy(dtype=float)
+    res["range"] = res["max"] - res["min"]
+    res["iqr"] = res["q75"] - res["q25"]
+    res["qspread"] = res["q90"] - res["q10"]
+    return res
+
+
+def seasonal_residual_layer(x: np.ndarray, train_end: int, periods: List[int]) -> Tuple[np.ndarray, int]:
+    n = len(x)
+    train = x[:train_end]
+    best_p, best_corr = -1, -np.inf
+    for p in periods:
+        if p < 2 or train_end <= 2 * p:
+            continue
+        a, b = train[p:], train[:-p]
+        if np.std(a) < 1e-9 or np.std(b) < 1e-9:
+            continue
+        corr = np.corrcoef(a, b)[0, 1]
+        if np.isfinite(corr) and corr > best_corr:
+            best_corr, best_p = corr, p
+    out = np.zeros(n, dtype=float)
+    if best_p == -1:
+        return out, -1
+    out[best_p:] = np.abs(x[best_p:] - x[:-best_p])
+    out[:best_p] = out[best_p]
+    return out, best_p
+
+
+def ar_residual_layer(x: np.ndarray, train_end: int, p: int = 12) -> np.ndarray:
+    n = len(x)
+    out = np.zeros(n, dtype=float)
+    if train_end <= p + 10:
+        return out
+    X = np.vstack([x[i-p:i] for i in range(p, train_end)])
+    y = x[p:train_end]
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    for i in range(p, n):
+        out[i] = abs(x[i] - float(np.dot(x[i-p:i], coef)))
+    return out
+
+
+def ewma_residual_layer(x: np.ndarray, alpha: float) -> np.ndarray:
+    out = np.zeros_like(x, dtype=float)
+    m = x[0]
+    for i in range(1, len(x)):
+        pred = m
+        out[i] = abs(x[i] - pred)
+        m = alpha * x[i] + (1 - alpha) * m
+    return out
+
+
+def cusum_layer(x: np.ndarray, train_end: int, drift: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
+    mu = np.median(x[:train_end])
+    mad = np.median(np.abs(x[:train_end] - mu)) + 1e-9
+    z = (x - mu) / mad
+    up = np.zeros(len(x))
+    down = np.zeros(len(x))
+    for i in range(1, len(x)):
+        up[i] = max(0.0, up[i-1] + z[i] - drift)
+        down[i] = max(0.0, down[i-1] - z[i] - drift)
+    return up, down
+
+
+def spectral_entropy_layer(x: np.ndarray, w: int, causal: bool) -> np.ndarray:
+    n = len(x)
+    out = np.zeros(n, dtype=float)
+    if w >= n:
+        return out
+    if causal:
+        rng = range(w, n)
+        for i in rng:
+            win = x[i-w:i]
+            _, psd = periodogram(win)
+            psd = psd / (psd.sum() + 1e-12)
+            out[i] = -np.sum(psd * np.log(psd + 1e-12))
+        out[:w] = out[w]
+    else:
+        h = w // 2
+        for i in range(h, n-h):
+            win = x[i-h:i+h]
+            _, psd = periodogram(win)
+            psd = psd / (psd.sum() + 1e-12)
+            out[i] = -np.sum(psd * np.log(psd + 1e-12))
+        out[:h] = out[h]
+        out[n-h:] = out[n-h-1]
+    return out
+
+
+def build_semantic_layers(x_raw: np.ndarray, train_end: int, windows: List[int], seasonal_periods: List[int],
+                          layer_smooth: float, causal: bool, use_log: bool) -> Tuple[np.ndarray, List[str], Dict[str, float]]:
+    x = robust_scale_signal(x_raw, train_end, use_log=use_log)
+    base_med = np.median(x[:train_end])
+    base_mean = np.mean(x[:train_end])
+    layers, names = [], []
+
+    def add(name: str, values: np.ndarray, positive_only: bool = True):
+        z = robust_z(values, train_end, positive_only=positive_only)
+        if layer_smooth > 0:
+            z = gaussian_filter1d(z, sigma=layer_smooth)
+        layers.append(z)
+        names.append(name)
+
+    dx = np.r_[0.0, np.diff(x)]
+    rel_dx = np.r_[0.0, np.abs(np.diff(x)) / (np.abs(x[:-1]) + 1.0)]
+
+    add("amp_abs", np.abs(x - base_med))
+    add("point_up", x - base_med)
+    add("point_down", base_med - x)
+    add("diff_abs", np.abs(dx))
+    add("diff_up", dx)
+    add("diff_down", -dx)
+    add("relative_change", rel_dx)
+
+    seas, period = seasonal_residual_layer(x, train_end, seasonal_periods)
+    add(f"seasonal_residual_p{period}", seas)
+    if period > 0:
+        signed = np.zeros_like(x)
+        signed[period:] = x[period:] - x[:-period]
+        add(f"seasonal_up_p{period}", signed)
+        add(f"seasonal_down_p{period}", -signed)
+
+    add("ar12_residual", ar_residual_layer(x, train_end, p=12))
+    add("ewma_residual_fast", ewma_residual_layer(x, alpha=0.3))
+    add("ewma_residual_slow", ewma_residual_layer(x, alpha=0.05))
+    cu, cd = cusum_layer(x, train_end, drift=0.2)
+    add("cusum_up", cu)
+    add("cusum_down", cd)
+
+    for w in windows:
+        feats = rolling_stats(x, w, causal)
+        add(f"level_abs_w{w}", np.abs(feats["median"] - base_med))
+        add(f"level_up_w{w}", feats["median"] - base_med)
+        add(f"level_down_w{w}", base_med - feats["median"])
+        add(f"mean_abs_w{w}", np.abs(feats["mean"] - base_mean))
+        add(f"var_high_w{w}", feats["std"])
+        add(f"iqr_high_w{w}", feats["iqr"])
+        add(f"range_high_w{w}", feats["range"])
+        add(f"flat_std_low_w{w}", np.median(feats["std"][:train_end]) - feats["std"])
+        add(f"flat_range_low_w{w}", np.median(feats["range"][:train_end]) - feats["range"])
+
+        train_med = np.median(feats["median"][:train_end])
+        train_q10 = np.quantile(feats["median"][:train_end], 0.10)
+        train_q90 = np.quantile(feats["median"][:train_end], 0.90)
+        add(f"local_quantile_break_w{w}", np.maximum(feats["median"] - train_q90, train_q10 - feats["median"]))
+
+        if w >= 8:
+            half = max(2, w // 2)
+            s = pd.Series(x)
+            if causal:
+                recent = s.rolling(half, min_periods=max(2, half//3)).mean()
+                past = recent.shift(half)
+                cp = (recent - past).bfill().ffill().fillna(0).to_numpy(dtype=float)
+            else:
+                left = s.rolling(half, center=False, min_periods=max(2, half//3)).mean()
+                right = s[::-1].rolling(half, center=False, min_periods=max(2, half//3)).mean()[::-1]
+                cp = (right - left).bfill().ffill().fillna(0).to_numpy(dtype=float)
+            add(f"changepoint_abs_w{w}", np.abs(cp))
+            add(f"changepoint_up_w{w}", cp)
+            add(f"changepoint_down_w{w}", -cp)
+
+    for w in [64, 128, 256]:
+        if w < len(x):
+            add(f"spectral_entropy_w{w}", spectral_entropy_layer(x, w, causal))
+
+    R = np.column_stack(layers)
+    R = np.nan_to_num(R, nan=0.0, posinf=0.0, neginf=0.0)
+    return R, names, {"seasonal_period": float(period)}
+
+
+def aggregate_modes(R: np.ndarray, names: List[str], train_end: int, score_smooth: float) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    def idx(words):
+        return [i for i, name in enumerate(names) if any(w in name for w in words)]
+
+    groups = {
+        "all_peak": list(range(R.shape[1])),
+        "up": idx(["up", "cusum_up"]),
+        "down": idx(["down", "cusum_down"]),
+        "flat": idx(["flat"]),
+        "level": idx(["level", "mean_abs", "local_quantile"]),
+        "variance": idx(["var_high", "iqr_high", "range_high"]),
+        "change": idx(["changepoint", "diff", "relative_change", "cusum"]),
+        "frequency": idx(["spectral", "seasonal"]),
+        "residual": idx(["residual", "ewma", "ar12"]),
+    }
+    scores = {}
+    for g, ids in groups.items():
+        if not ids:
+            continue
+        if g == "all_peak":
+            raw = R[:, ids].max(axis=1)
+        else:
+            k = min(4, len(ids))
+            raw = np.sort(R[:, ids], axis=1)[:, -k:].mean(axis=1)
+        z = robust_z(raw, train_end)
+        if score_smooth > 0:
+            z = gaussian_filter1d(z, sigma=score_smooth)
+        scores[g] = z
+
+    M = np.column_stack(list(scores.values()))
+    hybrid = np.sort(M, axis=1)[:, -min(3, M.shape[1]):].mean(axis=1)
+    hybrid = robust_z(hybrid, train_end)
+    if score_smooth > 0:
+        hybrid = gaussian_filter1d(hybrid, sigma=score_smooth)
+    scores["hybrid"] = hybrid
+    return hybrid, scores
+
+
+def build_response_table(args, series_key: str, labels_all: Dict, windows_all: Dict, split_name: str):
+    df = load_csv(args.data_path, series_key)
+    x_raw = df["value"].to_numpy(dtype=float)
+    y_sparse = labels_to_sparse_point_mask(df, labels_all[series_key])
+    y_window = windows_to_point_mask(df, windows_all[series_key])
+
+    train_end = choose_clean_train_prefix(
+        y_window=y_window,
+        n=len(df),
+        train_ratio=args.train_ratio,
+        min_train=max(args.windows),
+        use_labels=not args.no_label_clean_train,
     )
 
-    model.train()
-    for _ in tqdm(range(epochs), desc=("Masked AE" if masked else "AE"), leave=False):
-        for (xb,) in loader:
-            xb = xb.to(device)
+    R, layer_names, meta = build_semantic_layers(
+        x_raw=x_raw,
+        train_end=train_end,
+        windows=args.windows,
+        seasonal_periods=args.seasonal_periods,
+        layer_smooth=args.layer_smooth,
+        causal=args.causal,
+        use_log=not args.no_log_preprocess,
+    )
+    hybrid, modes = aggregate_modes(R, layer_names, train_end, args.score_smooth)
 
-            if masked:
-                mask = (torch.rand_like(xb) < mask_ratio).float()
-                x_in = xb * (1.0 - mask)
-                rec, _ = model(x_in)
-                loss = (((rec - xb) ** 2) * (mask + 0.1)).mean()
-            else:
-                noisy = xb + denoise_noise * torch.randn_like(xb) if denoise_noise > 0 else xb
-                rec, _ = model(noisy)
-                loss = F.mse_loss(rec, xb)
+    mode_names = ["hybrid", "all_peak", "up", "down", "flat", "level", "variance", "change", "frequency", "residual"]
+    X_parts = []
+    feature_names = []
+    for m in mode_names:
+        if m in modes:
+            X_parts.append(modes[m].reshape(-1, 1))
+            feature_names.append(f"mode_{m}")
 
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+    top1 = R.max(axis=1)
+    top3 = np.sort(R, axis=1)[:, -min(3, R.shape[1]):].mean(axis=1)
+    top8 = np.sort(R, axis=1)[:, -min(8, R.shape[1]):].mean(axis=1)
+    active = (R > 3.0).mean(axis=1)
+    X_parts += [top1.reshape(-1,1), top3.reshape(-1,1), top8.reshape(-1,1), active.reshape(-1,1)]
+    feature_names += ["layer_top1", "layer_top3", "layer_top8", "layer_active_frac"]
 
-    return model
+    X = np.column_stack(X_parts).astype(np.float32)
+    X = np.log1p(np.maximum(X, 0.0))
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-
-
-def ae_responses(model, X: np.ndarray, batch_size=256, device_setting="auto"):
-    if model is None:
-        return np.zeros(len(X), dtype=np.float32), np.zeros((len(X), 1), dtype=np.float32)
-
-    dev = choose_torch_device(device_setting)
-    model.eval()
-
-    errs, latents = [], []
-    with torch.no_grad():
-        for i in range(0, len(X), batch_size):
-            xb = torch.tensor(X[i:i + batch_size], dtype=torch.float32, device=dev)
-            rec, z = model(xb)
-            errs.append(torch.mean((rec - xb) ** 2, dim=1).cpu().numpy())
-            latents.append(z.cpu().numpy())
-
-    return np.concatenate(errs).astype(np.float32), np.vstack(latents).astype(np.float32)
-
-
-
-def train_embedding_net(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    embedding_dim: int,
-    learning_rate: float,
-    batch_size: int,
-    embedding_epochs: int,
-    device_setting: str,
-):
-    if not TORCH_AVAILABLE:
-        return None
-
-    device = choose_torch_device(device_setting)
-    model = ECGEmbeddingNet(X_train.shape[1], embedding_dim).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-
-    X_t = torch.tensor(X_train, dtype=torch.float32)
-    y_t = torch.tensor(y_train, dtype=torch.float32)
-    loader = DataLoader(TensorDataset(X_t, y_t), batch_size=batch_size, shuffle=True)
-
-    pos = max(float(y_train.sum()), 1.0)
-    neg = max(float(len(y_train) - y_train.sum()), 1.0)
-    pos_weight = torch.tensor([neg / pos], dtype=torch.float32, device=device)
-
-    model.train()
-    for _ in tqdm(range(embedding_epochs), desc="Supervised embedding", leave=False):
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            logit, _ = model(xb)
-            loss = F.binary_cross_entropy_with_logits(logit, yb, pos_weight=pos_weight)
-
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-    return model
+    info = {
+        "series": series_key,
+        "category": series_key.split("/")[0] if "/" in series_key else "unknown",
+        "split": split_name,
+        "df": df,
+        "X": X,
+        "feature_names": feature_names,
+        "y_window": y_window.astype(int),
+        "y_sparse": y_sparse.astype(int),
+        "train_end": train_end,
+        "meta": meta,
+        "modes": modes,
+        "hybrid": hybrid,
+    }
+    return info
 
 
 
-def embedding_responses(model, X_train, y_train, X_all, batch_size: int, device_setting: str):
-    if model is None:
-        return np.zeros((len(X_all), 3), dtype=np.float32), ["emb_prob", "emb_normal_dist", "emb_margin"]
+def make_stratified_series_split(keys: List[str], windows_all: Dict, labels_all: Dict, test_size: float, seed: int) -> pd.DataFrame:
+    rows = []
+    for k in keys:
+        category = k.split("/")[0] if "/" in k else "unknown"
+        has_anom = 1 if len(windows_all.get(k, [])) > 0 else 0
+        rows.append({"series": k, "category": category, "has_anom": has_anom})
+    df = pd.DataFrame(rows)
+    df["stratum"] = df["category"] + "__" + df["has_anom"].astype(str)
 
-    dev = choose_torch_device(device_setting)
-    model.eval()
+    counts = df["stratum"].value_counts()
+    df["stratum_safe"] = df["stratum"]
+    rare = set(counts[counts < 2].index)
+    df.loc[df["stratum_safe"].isin(rare), "stratum_safe"] = df.loc[df["stratum_safe"].isin(rare), "category"]
 
-    probs, Z = [], []
-    with torch.no_grad():
-        for i in range(0, len(X_all), batch_size):
-            xb = torch.tensor(X_all[i:i + batch_size], dtype=torch.float32, device=dev)
-            logit, z = model(xb)
-            probs.append(torch.sigmoid(logit).cpu().numpy())
-            Z.append(z.cpu().numpy())
+    counts2 = df["stratum_safe"].value_counts()
+    rare2 = set(counts2[counts2 < 2].index)
+    df.loc[df["stratum_safe"].isin(rare2), "stratum_safe"] = "anom_" + df.loc[df["stratum_safe"].isin(rare2), "has_anom"].astype(str)
 
-    prob = np.concatenate(probs).reshape(-1, 1)
-    Z = np.vstack(Z).astype(np.float32)
+    y = df["stratum_safe"].to_numpy()
+    try:
+        splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        train_idx, test_idx = next(splitter.split(df["series"], y))
+    except Exception:
+        splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        train_idx, test_idx = next(splitter.split(df["series"], df["category"]))
 
-    Z_train = Z[:len(X_train)]
-    zn = Z_train[y_train == 0] if np.any(y_train == 0) else Z_train
-    za = Z_train[y_train == 1] if np.any(y_train == 1) else Z_train
-
-    cn = np.median(zn, axis=0, keepdims=True)
-    ca = np.median(za, axis=0, keepdims=True)
-
-    dn = np.sqrt(np.mean((Z - cn) ** 2, axis=1, keepdims=True))
-    da = np.sqrt(np.mean((Z - ca) ** 2, axis=1, keepdims=True))
-    margin = dn - da
-
-    return np.column_stack([prob, dn, margin]).astype(np.float32), ["emb_prob", "emb_normal_dist", "emb_margin"]
-
-
-
-def robust_response_from_train(values_train: np.ndarray, values_all: np.ndarray, positive_only=True) -> np.ndarray:
-    med = np.median(values_train, axis=0, keepdims=True)
-    mad = np.median(np.abs(values_train - med), axis=0, keepdims=True) + 1e-6
-    z = (values_all - med) / mad
-    z = np.maximum(z, 0.0) if positive_only else np.abs(z)
-    return np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-
-def nearest_centroid_distance(X_train_normal: np.ndarray, X_all: np.ndarray) -> np.ndarray:
-    center = np.median(X_train_normal, axis=0, keepdims=True)
-    mad = np.median(np.abs(X_train_normal - center), axis=0, keepdims=True) + 1e-6
-    z = (X_all - center) / mad
-    return np.sqrt(np.mean(z ** 2, axis=1)).astype(np.float32)
-
-
-def build_semantic_responses(X_train_raw, y_train, X_test_raw, seed: int):
-    X_train_scaled, X_test_scaled, _ = robust_normalize_train_test(X_train_raw, X_test_raw)
-    X_train_shape = per_sample_center_scale(X_train_scaled)
-    X_test_shape = per_sample_center_scale(X_test_scaled)
-    X_all_shape = np.vstack([X_train_shape, X_test_shape])
-
-    X_train_normal = X_train_shape[y_train == 0]
-    if len(X_train_normal) == 0:
-        X_train_normal = X_train_shape
-
-    response_parts, response_names = [], []
-
-    F_train, stat_names = build_statistical_feature_matrix(X_train_shape)
-    F_test, _ = build_statistical_feature_matrix(X_test_shape)
-    F_all = np.vstack([F_train, F_test])
-
-    F_ref = F_train[y_train == 0] if np.any(y_train == 0) else F_train
-    F_resp = robust_response_from_train(F_ref, F_all, positive_only=False)
-    response_parts.append(F_resp)
-    response_names += [f"stat_{n}" for n in stat_names]
-
-    raw_dist = nearest_centroid_distance(X_train_normal, X_all_shape).reshape(-1, 1)
-    response_parts.append(raw_dist)
-    response_names.append("raw_shape_distance")
-
-    response_parts.append(F_resp.max(axis=1, keepdims=True))
-    response_parts.append(np.sort(F_resp, axis=1)[:, -min(5, F_resp.shape[1]):].mean(axis=1, keepdims=True))
-    response_parts.append((F_resp > 3.0).mean(axis=1, keepdims=True))
-    response_names += ["stat_top1", "stat_top5", "stat_active_frac"]
-
-    use_shapelets = True
-    if use_shapelets:
-        shapelet_lengths = [16, 32, 48]
-        shapelets_per_class = 24
-
-        protos, plabels = extract_random_shapelets(
-            X_train_shape,
-            y_train,
-            shapelet_lengths,
-            shapelets_per_class,
-            seed,
-        )
-        S_all, S_names = shapelet_response_features(X_all_shape, protos, plabels)
-        S_resp = robust_response_from_train(S_all[:len(X_train_shape)], S_all, positive_only=False)
-
-        response_parts.append(S_resp)
-        response_names += S_names
-
-    device_setting = "auto"
-    batch_size = 128
-    learning_rate = 1e-3
-    latent_dim = 20
-    ae_epochs = 30
-    mask_ratio = 0.25
-    denoise_noise = 0.03
-
-    use_ae = True
-    if use_ae:
-        ae = train_autoencoder(
-            X_train_normal,
-            latent_dim=latent_dim,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            epochs=ae_epochs,
-            device_setting=device_setting,
-            masked=False,
-            denoise_noise=denoise_noise,
-        )
-        ae_err_train, ae_lat_train = ae_responses(ae, X_train_shape, batch_size=batch_size, device_setting=device_setting)
-        ae_err_test, ae_lat_test = ae_responses(ae, X_test_shape, batch_size=batch_size, device_setting=device_setting)
-
-        ae_err_all = np.r_[ae_err_train, ae_err_test].reshape(-1, 1)
-        ae_ref = ae_err_train[y_train == 0].reshape(-1, 1) if np.any(y_train == 0) else ae_err_train.reshape(-1, 1)
-
-        response_parts.append(robust_response_from_train(ae_ref, ae_err_all, positive_only=True))
-        response_names.append("ae_reconstruction_error")
-
-        lat_all = np.vstack([ae_lat_train, ae_lat_test])
-        lat_ref = ae_lat_train[y_train == 0] if np.any(y_train == 0) else ae_lat_train
-
-        response_parts.append(nearest_centroid_distance(lat_ref, lat_all).reshape(-1, 1))
-        response_names.append("ae_latent_distance")
-
-    use_masked_ae = True
-    if use_masked_ae:
-        mae = train_autoencoder(
-            X_train_normal,
-            latent_dim=latent_dim,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            epochs=ae_epochs,
-            device_setting=device_setting,
-            masked=True,
-            mask_ratio=mask_ratio,
-        )
-        mae_err_train, _ = ae_responses(mae, X_train_shape, batch_size=batch_size, device_setting=device_setting)
-        mae_err_test, _ = ae_responses(mae, X_test_shape, batch_size=batch_size, device_setting=device_setting)
-
-        mae_err_all = np.r_[mae_err_train, mae_err_test].reshape(-1, 1)
-        mae_ref = mae_err_train[y_train == 0].reshape(-1, 1) if np.any(y_train == 0) else mae_err_train.reshape(-1, 1)
-
-        response_parts.append(robust_response_from_train(mae_ref, mae_err_all, positive_only=True))
-        response_names.append("masked_ae_error")
-
-    use_supervised_embedding = True
-    if use_supervised_embedding:
-        embedding_dim = 24
-        embedding_epochs = 40
-
-        emb = train_embedding_net(
-            X_train_shape,
-            y_train,
-            embedding_dim=embedding_dim,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            embedding_epochs=embedding_epochs,
-            device_setting=device_setting,
-        )
-        E_all, E_names = embedding_responses(
-            emb,
-            X_train_shape,
-            y_train,
-            X_all_shape,
-            batch_size=batch_size,
-            device_setting=device_setting,
-        )
-
-        E_prob = E_all[:, :1]
-        E_dist = robust_response_from_train(E_all[:len(X_train_shape), 1:], E_all[:, 1:], positive_only=False)
-
-        response_parts.append(np.column_stack([E_prob, E_dist]))
-        response_names += E_names
-
-    R_all = np.column_stack(response_parts).astype(np.float32)
-    R_all = np.log1p(np.maximum(R_all, 0.0))
-    R_all = np.nan_to_num(R_all, nan=0.0, posinf=0.0, neginf=0.0)
-
-    n_train = len(X_train_raw)
-    return R_all[:n_train], R_all[n_train:], response_names
+    df["split"] = "train"
+    df.loc[test_idx, "split"] = "test"
+    return df.sort_values(["split", "category", "series"]).reset_index(drop=True)
 
 
 
-def train_fusion_model(X_train, y_train, aggregator: str, seed: int):
-    n_estimators = 500
-    max_depth = 10
-    min_samples_leaf = 6
-    logreg_C = 1.0
+def sample_training_points(infos: List[Dict], max_points_per_series: int, neg_pos_ratio: float, seed: int):
+    rng = np.random.default_rng(seed)
+    Xs, ys, groups = [], [], []
+    for info in infos:
+        X = info["X"]
+        y = info["y_window"]
+        n = len(y)
+        pos_idx = np.where(y == 1)[0]
+        neg_idx = np.where(y == 0)[0]
 
-    if aggregator == "logreg":
+        if len(pos_idx) > max_points_per_series // 2:
+            pos_idx = rng.choice(pos_idx, size=max_points_per_series // 2, replace=False)
+        n_neg = int(max(len(pos_idx) * neg_pos_ratio, max_points_per_series // 3))
+        n_neg = min(n_neg, len(neg_idx), max_points_per_series)
+        if n_neg > 0:
+            neg_idx = rng.choice(neg_idx, size=n_neg, replace=False)
+        idx = np.concatenate([pos_idx, neg_idx]) if len(pos_idx) or len(neg_idx) else np.array([], dtype=int)
+        if len(idx) == 0:
+            continue
+        rng.shuffle(idx)
+        Xs.append(X[idx])
+        ys.append(y[idx])
+        groups.extend([info["series"]] * len(idx))
+    return np.vstack(Xs), np.concatenate(ys).astype(int), np.array(groups)
+
+
+def make_model(args):
+    if args.aggregator == "logreg":
         return make_pipeline(
             StandardScaler(),
-            LogisticRegression(max_iter=3000, class_weight="balanced", C=logreg_C, random_state=seed),
-        ).fit(X_train, y_train)
-
-    if aggregator == "extra":
-        return ExtraTreesClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_leaf=min_samples_leaf,
-            class_weight="balanced",
-            n_jobs=-1,
-            random_state=seed,
-        ).fit(X_train, y_train)
-
-    if aggregator == "rf":
+            LogisticRegression(max_iter=2000, class_weight="balanced", C=args.logreg_C, random_state=args.seed)
+        )
+    if args.aggregator == "rf":
         return RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_leaf=min_samples_leaf,
+            n_estimators=args.n_estimators,
+            max_depth=args.max_depth,
+            min_samples_leaf=args.min_samples_leaf,
             class_weight="balanced_subsample",
+            random_state=args.seed,
             n_jobs=-1,
-            random_state=seed,
-        ).fit(X_train, y_train)
+        )
+    if args.aggregator == "extra":
+        return ExtraTreesClassifier(
+            n_estimators=args.n_estimators,
+            max_depth=args.max_depth,
+            min_samples_leaf=args.min_samples_leaf,
+            class_weight="balanced",
+            random_state=args.seed,
+            n_jobs=-1,
+        )
+    if args.aggregator == "hgb":
+        return HistGradientBoostingClassifier(
+            max_iter=args.n_estimators,
+            learning_rate=args.learning_rate,
+            max_leaf_nodes=31,
+            l2_regularization=0.1,
+            random_state=args.seed,
+        )
+    raise ValueError(args.aggregator)
 
-    if aggregator == "ensemble":
-        return [
-            train_fusion_model(X_train, y_train, "extra", seed),
-            train_fusion_model(X_train, y_train, "rf", seed),
-            train_fusion_model(X_train, y_train, "logreg", seed),
-        ]
 
-    raise ValueError(f"Unknown aggregator: {aggregator}")
-
-
-
-def predict_fusion(model, X):
-    if isinstance(model, list):
-        return np.mean(np.column_stack([predict_fusion(m, X) for m in model]), axis=1)
+def model_scores(model, X: np.ndarray) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
     return model.predict_proba(X)[:, 1]
 
 
-def train_unsupervised_detector(R_train, y_train, unsup_detector: str, contamination: float, seed: int):
-    R_normal = R_train[y_train == 0]
-    if len(R_normal) == 0:
-        R_normal = R_train
 
-    if unsup_detector == "iforest":
-        return IsolationForest(
-            n_estimators=300,
-            contamination=contamination,
-            random_state=seed,
-            n_jobs=-1,
-        ).fit(R_normal)
-
-    return make_pipeline(
-        StandardScaler(),
-        OneClassSVM(nu=contamination, kernel="rbf", gamma="scale"),
-    ).fit(R_normal)
+def parse_float_grid(s: str) -> List[float]:
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
 
 
-
-def predict_unsupervised(model, R):
-    if model is None:
-        return np.zeros(len(R), dtype=np.float32)
-    s = -model.decision_function(R) if hasattr(model, "decision_function") else -model.score_samples(R)
-    s = np.asarray(s, dtype=np.float32)
-    return (s - np.min(s)) / (np.max(s) - np.min(s) + 1e-9)
+def parse_int_grid(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
-def choose_threshold_from_train(score_train, y_train, metric="f1"):
-    qs = np.linspace(0.01, 0.99, 200)
-    candidates = np.unique(np.quantile(score_train, qs))
-    best = (-1.0, 0.5)
-    for thr in candidates:
-        pred = (score_train >= thr).astype(int)
-        p, r, f1, _ = precision_recall_fscore_support(y_train, pred, average="binary", zero_division=0)
-        if metric == "precision_recall_balance":
-            val = 0.5 * f1 + 0.25 * p + 0.25 * r
-        elif metric == "precision":
-            val = p
-        elif metric == "recall":
-            val = r
-        else:
-            val = f1
-        if val > best[0]:
-            best = (float(val), float(thr))
-    return best[1], best[0]
-
-
-def eval_binary(y_true, score, thr) -> Dict[str, float]:
-    pred = (score >= thr).astype(int)
-    p, r, f1, _ = precision_recall_fscore_support(y_true, pred, average="binary", zero_division=0)
-    acc = accuracy_score(y_true, pred)
-    try:
-        roc = roc_auc_score(y_true, score)
-    except Exception:
-        roc = np.nan
-    try:
-        pr = average_precision_score(y_true, score)
-    except Exception:
-        pr = np.nan
-    tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+def train_metric_value(y_true: np.ndarray, pred: np.ndarray, score: np.ndarray, args) -> Dict[str, float]:
+    win = evaluate(y_true, pred, score)
+    ev = event_window_f1(y_true, pred)
+    soft = soft_event_metrics(y_true, pred)
+    nab = nab_like_score(y_true, pred, args.nab_fp_weight, args.nab_fn_weight)
     return {
-        "accuracy": float(acc), "precision": float(p), "recall": float(r), "f1": float(f1),
-        "roc_auc": float(roc), "pr_auc": float(pr), "tn": int(tn), "fp": int(fp),
-        "fn": int(fn), "tp": int(tp), "threshold": float(thr),
-        "pred_positive_ratio": float(pred.mean()), "true_positive_ratio": float(y_true.mean()),
+        "window_f1": win["f1"],
+        "event_f1": ev["event_f1"],
+        "soft_event_f1": soft["soft_event_f1"],
+        "nab_like": nab["nab_like_score"],
+        "pred_ratio": win["pred_ratio"],
+        "gt_ratio": win["gt_ratio"],
+        "event_fp": ev["event_fp"],
+        "event_fn": ev["event_fn"],
     }
 
 
-def run_one_split(X_raw, y, train_idx, test_idx, seed: int, split_name="split"):
-    X_train_raw, X_test_raw = X_raw[train_idx], X_raw[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
+def objective_from_metrics(metrics: Dict[str, float], args) -> float:
+    if args.threshold_metric == "event_f1":
+        return metrics["event_f1"]
+    if args.threshold_metric == "soft_event_f1":
+        return metrics["soft_event_f1"]
+    if args.threshold_metric == "nab_like":
+        return metrics["nab_like"]
+    if args.threshold_metric == "window_f1":
+        return metrics["window_f1"]
 
-    R_train, R_test, response_names = build_semantic_responses(X_train_raw, y_train, X_test_raw, seed)
-
-    aggregator = "ensemble"
-    fusion = train_fusion_model(R_train, y_train, aggregator, seed)
-
-    s_train_sup = predict_fusion(fusion, R_train)
-    s_test_sup = predict_fusion(fusion, R_test)
-
-    use_unsup_vector_detector = True
-    if use_unsup_vector_detector:
-        unsup_detector = "iforest"
-        contamination = 0.15
-        supervised_weight = 0.90
-
-        unsup = train_unsupervised_detector(R_train, y_train, unsup_detector, contamination, seed)
-        s_train_unsup = predict_unsupervised(unsup, R_train)
-        s_test_unsup = predict_unsupervised(unsup, R_test)
-
-        score_train = supervised_weight * s_train_sup + (1.0 - supervised_weight) * s_train_unsup
-        score_test = supervised_weight * s_test_sup + (1.0 - supervised_weight) * s_test_unsup
-    else:
-        score_train, score_test = s_train_sup, s_test_sup
-
-    threshold_metric = "precision_recall_balance"
-    thr, train_obj = choose_threshold_from_train(score_train, y_train, metric=threshold_metric)
-
-    train_metrics = eval_binary(y_train, score_train, thr)
-    test_metrics = eval_binary(y_test, score_test, thr)
-
-    train_metrics.update({"split": split_name, "part": "train", "train_threshold_objective": train_obj})
-    test_metrics.update({"split": split_name, "part": "test", "train_threshold_objective": train_obj})
-
-    return {
-        "train_metrics": train_metrics,
-        "test_metrics": test_metrics,
-        "score_train": score_train,
-        "score_test": score_test,
-        "R_train": R_train,
-        "R_test": R_test,
-        "response_names": response_names,
-        "threshold": thr,
-        "train_idx": train_idx,
-        "test_idx": test_idx,
-        "y_train": y_train,
-        "y_test": y_test,
-    }
-
-
-
-def approximate_feature_importance(R_train, y_train, response_names, seed: int):
-    model = ExtraTreesClassifier(
-        n_estimators=600,
-        max_depth=None,
-        min_samples_leaf=4,
-        class_weight="balanced",
-        random_state=seed,
-        n_jobs=-1,
-    ).fit(R_train, y_train)
-
-    return pd.DataFrame({
-        "feature": response_names,
-        "importance": model.feature_importances_,
-    }).sort_values("importance", ascending=False)
-
-
-
-def semantic_group(feature: str) -> str:
-    f = feature.lower()
-    if "shapelet" in f or "template" in f:
-        return "forme asemanatoare cu exemple din train"
-    if "ae_reconstruction" in f or "masked_ae" in f:
-        return "reconstructie cu autoencoder"
-    if "ae_latent" in f or "emb_" in f:
-        return "spatiu latent / embedding"
-    if "wavelet" in f:
-        return "detalii pe scale diferite"
-    if "freq" in f:
-        return "frecvente"
-    if "part" in f:
-        return "bucati locale din ECG"
-    if "slope" in f or "curvature" in f:
-        return "panta si curbura semnalului"
-    if "peak" in f or "trough" in f or "zero" in f:
-        return "varfuri si forma ECG"
-    if "raw" in f or "shape" in f:
-        return "forma globala"
-    if "top" in f or "active" in f:
-        return "scoruri agregate"
-    return "statistici simple"
-
-
-def humanize_feature(feature: str) -> str:
-    f = feature.lower()
-    if "shapelet_abnormal" in f:
-        return "are o bucata care seamana mai mult cu exemple anormale"
-    if "shapelet_normal" in f:
-        return "nu seamana prea bine cu shapelet-urile normale"
-    if "shapelet_margin" in f:
-        return "e mai aproape de shapelet-uri anormale decat normale"
-    if "ae_reconstruction_error" in f:
-        return "autoencoderul antrenat pe normale nu o reconstruieste prea bine"
-    if "masked_ae" in f:
-        return "cand maschez parti din semnal, modelul nu le ghiceste bine"
-    if "ae_latent" in f:
-        return "in latent space pica mai departe de grupul normal"
-    if "emb_prob" in f:
-        return "embedding-ul supravegheat ii da probabilitate mare de anormal"
-    if "emb_normal_dist" in f:
-        return "embedding-ul e cam departe de centrul normal"
-    if "emb_margin" in f:
-        return "embedding-ul pare mai apropiat de abnormal decat de normal"
-    if "wavelet_detail" in f:
-        return "detaliile fine/multiscale arata diferit fata de normale"
-    if "wavelet_low" in f:
-        return "componenta mai neteda a semnalului e diferita"
-    if "freq_entropy" in f:
-        return "frecventele sunt mai imprastiate/neobisnuite"
-    if "freq_centroid" in f:
-        return "energia din frecvente e mutata fata de normal"
-    if "freq_high" in f or "freq_very_high" in f:
-        return "are mai multa energie pe frecvente inalte"
-    if "freq_low" in f:
-        return "are alta energie pe frecvente joase"
-    if "part" in f:
-        return "o zona locala din ECG iese din tiparul normal"
-    if "main_peak_pos" in f:
-        return "varful principal apare in alta zona decat de obicei"
-    if "main_peak_val" in f:
-        return "varful principal are amplitudine cam neobisnuita"
-    if "main_trough_val" in f:
-        return "minimul/trough-ul e cam diferit de normal"
-    if "peak_to_trough" in f:
-        return "diferenta varf-minim e cam mare/mica fata de normal"
-    if "peak_trough_distance" in f:
-        return "distanta dintre varf si minim nu prea arata normal"
-    if "n_peaks" in f:
-        return "numarul de varfuri nu prea seamana cu cel normal"
-    if "n_troughs" in f:
-        return "numarul de minime/trough-uri pare neobisnuit"
-    if "slope_energy" in f:
-        return "semnalul se schimba mai brusc decat in normale"
-    if "curvature_energy" in f:
-        return "curbura semnalului e mai ciudata"
-    if "zero_crossings" in f:
-        return "trece prin zero de un numar cam neobisnuit de ori"
-    if "raw_shape_distance" in f:
-        return "forma generala e departe de forma normala mediana"
-    if "stat_top1" in f:
-        return "cel mai mare raspuns semantic e ridicat"
-    if "stat_top5" in f:
-        return "mai multe raspunsuri semantice sunt ridicate in acelasi timp"
-    if "active_frac" in f:
-        return "multe feature-uri zic simultan ca ceva nu e ok"
-    if "amp_range" in f:
-        return "range-ul amplitudinii e cam diferit"
-    if "energy" in f:
-        return "energia semnalului e diferita"
-    if "mean_abs" in f:
-        return "amplitudinea medie absoluta e neobisnuita"
-    if "std" in f:
-        return "variatia semnalului e diferita"
-    if "skew" in f:
-        return "semnalul e asimetric fata de normale"
-    if "kurt" in f:
-        return "are valori mai extreme decat in normale"
-    return "feature-ul asta are valoare neobisnuita fata de train"
-
-
-def _importance_vector(importance_df: pd.DataFrame, response_names: List[str]) -> np.ndarray:
-    imp_map = dict(zip(importance_df["feature"], importance_df["importance"]))
-    imp = np.array([float(imp_map.get(n, 0.0)) for n in response_names], dtype=np.float64)
-    if imp.sum() <= 0:
-        imp = np.ones(len(response_names), dtype=np.float64) / max(len(response_names), 1)
-    else:
-        imp = imp / imp.sum()
-    return imp
-
-
-def strength_word(value: float, all_values: np.ndarray) -> str:
-    q50 = float(np.quantile(all_values, 0.50))
-    q80 = float(np.quantile(all_values, 0.80))
-    q95 = float(np.quantile(all_values, 0.95))
-    if value >= q95:
-        return "foarte mare"
-    if value >= q80:
-        return "mare"
-    if value >= q50:
-        return "mediu"
-    return "mic"
-
-
-def compact_reason(feature: str, value: float, contrib: float, all_feature_values: np.ndarray) -> str:
-    level = strength_word(value, all_feature_values)
-    return f"{humanize_feature(feature)} (raspuns {level}, val={value:.3f}, contrib={contrib:.5f})"
-
-
-def make_student_explanation(prediction: int,
-                             score: float,
-                             threshold: float,
-                             top_reasons: List[str],
-                             top_groups: List[str],
-                             correct: int) -> str:
-    pred_text = "anormal" if prediction == 1 else "normal"
-    margin = score - threshold
-
-    if prediction == 1:
-        start = f"Modelul a zis {pred_text}, scor {score:.4f} peste pragul {threshold:.4f}."
-    else:
-        start = f"Modelul a zis {pred_text}, scor {score:.4f} sub pragul {threshold:.4f}."
-
-    if abs(margin) < 0.03:
-        confidence = "Nu e o decizie super clara, e destul de aproape de prag."
-    elif abs(margin) < 0.10:
-        confidence = "Decizia pare ok, dar nu e la foarte mare distanta de prag."
-    else:
-        confidence = "Decizia pare destul de clara dupa scor."
-
-    groups = []
-    for g in top_groups:
-        if g not in groups:
-            groups.append(g)
-
-    reason_text = "; ".join(top_reasons[:3])
-    group_text = ", ".join(groups[:3])
-
-    if correct:
-        ending = "Pe eticheta din dataset, predictia iese corecta."
-    else:
-        ending = "Pe eticheta din dataset, aici modelul greseste, deci explicatia trebuie privita cu grija."
-
+    nab01 = (metrics["nab_like"] + 1.0) / 2.0
+    pred_penalty = max(0.0, metrics["pred_ratio"] - args.target_max_pred_ratio)
     return (
-        f"{start} {confidence} Cel mai mult au contat zonele/feature-urile din: {group_text}. "
-        f"Pe scurt: {reason_text}. {ending}"
+        args.obj_event_weight * metrics["event_f1"]
+        + args.obj_soft_weight * metrics["soft_event_f1"]
+        + args.obj_nab_weight * nab01
+        + args.obj_window_weight * metrics["window_f1"]
+        - args.obj_pred_ratio_penalty * pred_penalty
     )
 
 
-def build_explanations_table(R: np.ndarray,
-                             response_names: List[str],
-                             scores: np.ndarray,
-                             threshold: float,
-                             y_true: np.ndarray,
-                             y_raw: np.ndarray,
-                             indices: np.ndarray,
-                             importance_df: pd.DataFrame,
-                             top_k: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def find_train_threshold(train_infos: List[Dict], train_scores: Dict[str, np.ndarray], args) -> float:
+    qs = np.linspace(args.thr_q_min, args.thr_q_max, args.thr_steps)
+    all_scores = np.concatenate([train_scores[i["series"]] for i in train_infos])
+    candidate_thr = np.unique(np.quantile(all_scores, qs))
 
-    imp = _importance_vector(importance_df, response_names)
-    contrib = R.astype(np.float64) * imp.reshape(1, -1)
-    pred = (scores >= threshold).astype(int)
-
-    rows = []
-    long_rows = []
-    group_rows = []
-
-    groups = [semantic_group(n) for n in response_names]
-    unique_groups = sorted(set(groups))
-
-    for i in range(len(R)):
-        order = np.argsort(contrib[i])[::-1]
-        top = order[:top_k]
-
-        top_features = []
-        top_groups = []
-        top_values = []
-        top_contribs = []
-        top_meanings = []
-
-        for j in top:
-            feature = response_names[j]
-            value = float(R[i, j])
-            contribution = float(contrib[i, j])
-            top_features.append(feature)
-            top_groups.append(groups[j])
-            top_values.append(value)
-            top_contribs.append(contribution)
-            top_meanings.append(compact_reason(feature, value, contribution, R[:, j]))
-
-        correct = int(pred[i] == y_true[i])
-        sentence = make_student_explanation(
-            prediction=int(pred[i]),
-            score=float(scores[i]),
-            threshold=float(threshold),
-            top_reasons=top_meanings,
-            top_groups=top_groups,
-            correct=correct,
-        )
-
-        rows.append({
-            "index": int(indices[i]),
-            "y_raw": int(y_raw[i]),
-            "y_true_binary": int(y_true[i]),
-            "prediction": int(pred[i]),
-            "score": float(scores[i]),
-            "threshold": float(threshold),
-            "distance_from_threshold": float(scores[i] - threshold),
-            "correct": correct,
-            "top_features": " | ".join(top_features),
-            "top_groups": " | ".join(top_groups),
-            "top_values": " | ".join(f"{v:.4f}" for v in top_values),
-            "top_contributions": " | ".join(f"{v:.6f}" for v in top_contribs),
-            "plain_reasons": " | ".join(top_meanings),
-            "explanation": sentence,
-        })
-
-        for rank, j in enumerate(top, start=1):
-            feature = response_names[j]
-            value = float(R[i, j])
-            contribution = float(contrib[i, j])
-            long_rows.append({
-                "index": int(indices[i]),
-                "rank": rank,
-                "feature": feature,
-                "group": groups[j],
-                "response_value": value,
-                "response_level": strength_word(value, R[:, j]),
-                "global_importance": float(imp[j]),
-                "local_contribution": contribution,
-                "meaning": humanize_feature(feature),
-                "student_style_reason": compact_reason(feature, value, contribution, R[:, j]),
-                "y_true_binary": int(y_true[i]),
-                "prediction": int(pred[i]),
-                "score": float(scores[i]),
-                "threshold": float(threshold),
-            })
-
-        for g in unique_groups:
-            ids = [j for j, gg in enumerate(groups) if gg == g]
-            group_contribution = float(contrib[i, ids].sum())
-            group_max = float(R[i, ids].max())
-            group_mean = float(R[i, ids].mean())
-            group_rows.append({
-                "index": int(indices[i]),
-                "group": g,
-                "group_contribution": group_contribution,
-                "group_max_response": group_max,
-                "group_mean_response": group_mean,
-                "y_true_binary": int(y_true[i]),
-                "prediction": int(pred[i]),
-                "score": float(scores[i]),
-                "threshold": float(threshold),
-            })
-
-    local_df = pd.DataFrame(rows)
-    long_df = pd.DataFrame(long_rows)
-    group_df = pd.DataFrame(group_rows)
-    return local_df, long_df, group_df
+    best = (-1e18, candidate_thr[0])
+    for thr in candidate_thr:
+        vals = []
+        for info in train_infos:
+            score = train_scores[info["series"]]
+            pred = postprocess_score(score, thr, args)
+            vals.append(objective_from_metrics(train_metric_value(info["y_window"], pred, score, args), args))
+        m = float(np.nanmean(vals))
+        if m > best[0]:
+            best = (m, float(thr))
+    if getattr(args, "verbose_thresholds", False):
+        print(f"Selected threshold on TRAIN only: {best[1]:.6f} using {args.threshold_metric} objective={best[0]:.4f}", flush=True)
+    return best[1]
 
 
-def global_group_importance(importance_df: pd.DataFrame) -> pd.DataFrame:
-    tmp = importance_df.copy()
-    tmp["group"] = tmp["feature"].map(semantic_group)
-    return tmp.groupby("group", as_index=False).agg(
-        total_importance=("importance", "sum"),
-        mean_importance=("importance", "mean"),
-        n_features=("feature", "count"),
-    ).sort_values("total_importance", ascending=False)
+def tune_postprocess_on_train(train_infos: List[Dict], train_scores: Dict[str, np.ndarray], args):
+    if not args.auto_tune_postprocess:
+        thr = find_train_threshold(train_infos, train_scores, args)
+        return args, thr, {
+            "auto_tune_postprocess": False,
+            "threshold": float(thr),
+            "threshold_metric": args.threshold_metric,
+        }
 
+    grid = list(itertools.product(
+        parse_int_grid(args.grid_min_segment),
+        parse_int_grid(args.grid_close_gap),
+        parse_int_grid(args.grid_expand_radius),
+        parse_float_grid(args.grid_max_pred_ratio),
+        parse_float_grid(args.grid_min_pred_ratio),
+        parse_float_grid(args.grid_nab_fp_weight),
+    ))
 
-def main():
-    seed = 42
-    seed_everything(seed)
+    original_grid_size = len(grid)
+    if args.autotune_max_combinations > 0 and len(grid) > args.autotune_max_combinations:
+        rng = np.random.default_rng(args.seed)
+        chosen = rng.choice(len(grid), size=args.autotune_max_combinations, replace=False)
+        grid = [grid[i] for i in chosen]
 
-    train_path = "/kaggle/input/datasets/salsabilahmid/ecg50000/ECG5000_TRAIN.txt"
-    test_path = "/kaggle/input/datasets/salsabilahmid/ecg50000/ECG5000_TEST.txt"
-    csv_path = None
+    print(f"\nAUTOTUNE postprocess: testing {len(grid)} / {original_grid_size} combinations "
+          f"x {args.thr_steps} threshold quantiles on {len(train_infos)} train series", flush=True)
 
-    label_position = "first"
-    label_col = "auto"
-    normal_label = 1
+    best = {"objective": -1e18}
+    best_args = None
+    best_thr = None
 
-    out_dir = "./semantic_ecg5000_results"
-    os.makedirs(out_dir, exist_ok=True)
+    for combo_i, (min_segment, close_gap, expand_radius, max_pred_ratio, min_pred_ratio, nab_fp_weight) in enumerate(
+        tqdm(grid, desc="Autotune postprocess", unit="combo"), start=1
+    ):
+        cand = copy.copy(args)
+        cand.min_segment = min_segment
+        cand.close_gap = close_gap
+        cand.expand_radius = expand_radius
+        cand.max_pred_ratio = max_pred_ratio
+        cand.min_pred_ratio = min_pred_ratio
+        cand.nab_fp_weight = nab_fp_weight
 
-    test_size = 0.25
-    X_raw, y, y_raw, train_idx, test_idx, split_mode = load_ecg_data(
-        train_path=train_path,
-        test_path=test_path,
-        csv_path=csv_path,
-        label_position=label_position,
-        label_col=label_col,
-        normal_label=normal_label,
-        test_size=test_size,
-        seed=seed,
-    )
+        thr = find_train_threshold(train_infos, train_scores, cand)
+        vals = []
+        debug = []
+        for info in train_infos:
+            score = train_scores[info["series"]]
+            pred = postprocess_score(score, thr, cand)
+            m = train_metric_value(info["y_window"], pred, score, cand)
+            vals.append(objective_from_metrics(m, cand))
+            debug.append(m)
+        obj = float(np.nanmean(vals))
+        mean_event = float(np.nanmean([d["event_f1"] for d in debug]))
+        mean_soft = float(np.nanmean([d["soft_event_f1"] for d in debug]))
+        mean_nab = float(np.nanmean([d["nab_like"] for d in debug]))
+        no_anom = [d for d in debug if d["gt_ratio"] == 0.0]
+        no_anom_acc = float(np.mean([d["pred_ratio"] == 0.0 for d in no_anom])) if no_anom else float("nan")
 
-    print("Split mode:", split_mode)
-    print("Samples:", len(X_raw), "Length:", X_raw.shape[1])
-    print("Binary abnormal ratio:", float(y.mean()))
-    print("Raw labels:", dict(zip(*np.unique(y_raw, return_counts=True))))
-    print("Torch available:", TORCH_AVAILABLE)
-
-    cv = False
-    all_rows = []
-
-    if cv and split_mode == "csv_stratified_split":
-        cv_folds = 5
-        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=seed)
-
-        last_result = None
-        for fold, (tr, te) in enumerate(skf.split(X_raw, y), start=1):
-            print(f"\n===== CV fold {fold}/{cv_folds} =====")
-
-            result = run_one_split(X_raw, y, tr, te, seed, split_name=f"fold_{fold}")
-            all_rows += [result["train_metrics"], result["test_metrics"]]
-
-            shown = ["accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc", "threshold"]
-            print("TRAIN:", {k: round(v, 4) if isinstance(v, float) else v for k, v in result["train_metrics"].items() if k in shown})
-            print("TEST :", {k: round(v, 4) if isinstance(v, float) else v for k, v in result["test_metrics"].items() if k in shown})
-
-            last_result = result
-
-        metrics_df = pd.DataFrame(all_rows)
-        metrics_df.to_csv(os.path.join(out_dir, "cv_metrics.csv"), index=False)
-
-        test_mean = metrics_df[metrics_df["part"] == "test"].mean(numeric_only=True).to_dict()
-        test_std = metrics_df[metrics_df["part"] == "test"].std(numeric_only=True).to_dict()
-
-        with open(os.path.join(out_dir, "cv_summary.json"), "w") as f:
-            json.dump(
-                {
-                    "mean": {k: float(v) for k, v in test_mean.items()},
-                    "std": {k: float(v) for k, v in test_std.items()},
-                },
-                f,
-                indent=2,
+        tie = (obj, mean_nab, mean_soft, no_anom_acc, -max_pred_ratio, -expand_radius, -close_gap)
+        best_tie = best.get("tie", (-1e18,))
+        if tie > best_tie:
+            best = {
+                "objective": obj,
+                "tie": tie,
+                "threshold": float(thr),
+                "threshold_metric": cand.threshold_metric,
+                "min_segment": int(min_segment),
+                "close_gap": int(close_gap),
+                "expand_radius": int(expand_radius),
+                "max_pred_ratio": float(max_pred_ratio),
+                "min_pred_ratio": float(min_pred_ratio),
+                "nab_fp_weight": float(nab_fp_weight),
+                "train_mean_event_f1": mean_event,
+                "train_mean_soft_event_f1": mean_soft,
+                "train_mean_nab_like": mean_nab,
+                "train_no_anomaly_accuracy": no_anom_acc,
+                "grid_size": len(grid),
+            }
+            best_args = cand
+            best_thr = thr
+            print(
+                f"[new best {combo_i}/{len(grid)}] obj={obj:.4f} "
+                f"event={mean_event:.4f} soft={mean_soft:.4f} nab={mean_nab:.4f} "
+                f"noanom={no_anom_acc:.3f} thr={thr:.4f} "
+                f"minseg={min_segment} close={close_gap} expand={expand_radius} "
+                f"maxratio={max_pred_ratio} fpw={nab_fp_weight}",
+                flush=True,
             )
 
-        result = last_result
+    print("\nSELECTED POSTPROCESSING ON TRAIN ONLY")
+    for k, v in best.items():
+        if k != "tie":
+            print(f"  {k}: {v}")
+    return best_args, best_thr, best
 
+
+def postprocess_score(score: np.ndarray, thr: float, args) -> np.ndarray:
+    raw = (score >= thr).astype(int)
+    pred = clean_mask(raw, min_segment=args.min_segment, close_gap=args.close_gap)
+    if pred.sum() > 0 and args.expand_radius > 0:
+        pred = expand_events(pred, args.expand_radius)
+        pred = clean_mask(pred, min_segment=args.min_segment, close_gap=args.close_gap)
+
+    if pred.mean() > args.max_pred_ratio:
+        pred = cap_by_top_components(score, pred, args.max_pred_ratio, args.min_segment)
+    if pred.mean() < args.min_pred_ratio:
+        pred[:] = 0
+    return pred.astype(int)
+
+
+def cap_by_top_components(score: np.ndarray, mask: np.ndarray, max_ratio: float, min_segment: int) -> np.ndarray:
+    n = len(mask)
+    cap = max(min_segment, int(round(n * max_ratio)))
+    segs = mask_to_segments(mask)
+    if not segs or mask.sum() <= cap:
+        return mask.astype(int)
+    ranked = []
+    for a, b in segs:
+        length = b - a + 1
+        mass = float(np.sum(score[a:b+1]))
+        peak = float(np.max(score[a:b+1]))
+        ranked.append((mass / np.sqrt(length) + 0.1 * peak, a, b, length))
+    ranked.sort(reverse=True)
+    out = np.zeros(n, dtype=int)
+    used = 0
+    for _, a, b, length in ranked:
+        if used + length > cap and used > 0:
+            continue
+        out[a:b+1] = 1
+        used += length
+        if used >= cap:
+            break
+    return clean_mask(out, min_segment=min_segment, close_gap=0)
+
+def safe_auc(y_true: np.ndarray, score: np.ndarray) -> Tuple[float, float]:
+    if len(np.unique(y_true)) <= 1:
+        return np.nan, np.nan
+    return float(roc_auc_score(y_true, score)), float(average_precision_score(y_true, score))
+
+
+def evaluate(y_true: np.ndarray, pred: np.ndarray, score: np.ndarray) -> Dict[str, float]:
+    gt_ratio = float(np.mean(y_true))
+    pred_ratio = float(np.mean(pred))
+    if gt_ratio == 0.0:
+        if pred_ratio == 0.0:
+            p = r = f1 = 1.0
+        else:
+            p = r = f1 = 0.0
     else:
-        result = run_one_split(X_raw, y, train_idx, test_idx, seed, split_name="fixed_or_single")
+        p, r, f1, _ = precision_recall_fscore_support(y_true, pred, average="binary", zero_division=0)
+    roc, pr = safe_auc(y_true, score)
+    return {"precision": float(p), "recall": float(r), "f1": float(f1), "pred_ratio": pred_ratio,
+            "gt_ratio": gt_ratio, "roc_auc": roc, "pr_auc": pr}
 
-        metrics_df = pd.DataFrame([result["train_metrics"], result["test_metrics"]])
-        metrics_df.to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
 
-        shown = ["accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc", "threshold", "tp", "fp", "tn", "fn"]
-        print("\nTRAIN:", {k: round(v, 4) if isinstance(v, float) else v for k, v in result["train_metrics"].items() if k in shown})
-        print("TEST :", {k: round(v, 4) if isinstance(v, float) else v for k, v in result["test_metrics"].items() if k in shown})
+def event_window_f1(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    gt_segments = mask_to_segments(y_true)
+    pred_segments = mask_to_segments(y_pred)
+    if len(gt_segments) == 0:
+        if len(pred_segments) == 0:
+            return {"event_precision": 1.0, "event_recall": 1.0, "event_f1": 1.0,
+                    "event_tp": 0, "event_fp": 0, "event_fn": 0}
+        return {"event_precision": 0.0, "event_recall": 0.0, "event_f1": 0.0,
+                "event_tp": 0, "event_fp": len(pred_segments), "event_fn": 0}
+    detected = []
+    for a, b in gt_segments:
+        detected.append(any(not (q < a or p > b) for p, q in pred_segments))
+    tp = int(sum(detected))
+    fn = len(gt_segments) - tp
+    fp = 0
+    for p, q in pred_segments:
+        if not any(not (q < a or p > b) for a, b in gt_segments):
+            fp += 1
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+    return {"event_precision": float(precision), "event_recall": float(recall), "event_f1": float(f1),
+            "event_tp": tp, "event_fp": fp, "event_fn": fn}
 
-        pred_test = (result["score_test"] >= result["threshold"]).astype(int)
-        pd.DataFrame({
-            "index": result["test_idx"],
-            "y_raw": y_raw[result["test_idx"]],
-            "y_true_binary": result["y_test"],
-            "score": result["score_test"],
-            "prediction": pred_test,
-        }).to_csv(os.path.join(out_dir, "predictions_test.csv"), index=False)
 
-        pd.DataFrame({
-            "index": np.r_[result["train_idx"], result["test_idx"]],
-            "split": ["train"] * len(result["train_idx"]) + ["test"] * len(result["test_idx"]),
-        }).to_csv(os.path.join(out_dir, "split_indices.csv"), index=False)
+def soft_event_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    gt_segments = mask_to_segments(y_true)
+    pred_segments = mask_to_segments(y_pred)
+    if len(gt_segments) == 0:
+        v = 1.0 if len(pred_segments) == 0 else 0.0
+        return {"soft_event_precision": v, "soft_event_recall": v, "soft_event_f1": v}
+    if len(pred_segments) == 0:
+        return {"soft_event_precision": 0.0, "soft_event_recall": 0.0, "soft_event_f1": 0.0}
 
-    try:
-        imp = approximate_feature_importance(result["R_train"], result["y_train"], result["response_names"], seed)
-        imp.to_csv(os.path.join(out_dir, "feature_importance.csv"), index=False)
+    def iou(s1, s2):
+        a, b = s1; p, q = s2
+        inter = max(0, min(b, q) - max(a, p) + 1)
+        union = (b - a + 1) + (q - p + 1) - inter
+        return inter / max(union, 1)
 
-        group_imp = global_group_importance(imp)
-        group_imp.to_csv(os.path.join(out_dir, "semantic_group_importance.csv"), index=False)
+    recall = np.mean([max(iou(g, p) for p in pred_segments) for g in gt_segments])
+    precision = np.mean([max(iou(p, g) for g in gt_segments) for p in pred_segments])
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+    return {"soft_event_precision": float(precision), "soft_event_recall": float(recall), "soft_event_f1": float(f1)}
 
-        print("\nTop semantic responses:")
-        print(imp.head(20).to_string(index=False))
 
-        print("\nSemantic group importance:")
-        print(group_imp.to_string(index=False))
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
-        explain_top_k = 5
-        local_test, long_test, group_test = build_explanations_table(
-            R=result["R_test"],
-            response_names=result["response_names"],
-            scores=result["score_test"],
-            threshold=result["threshold"],
-            y_true=result["y_test"],
-            y_raw=y_raw[result["test_idx"]],
-            indices=result["test_idx"],
-            importance_df=imp,
-            top_k=explain_top_k,
-        )
-        local_test.to_csv(os.path.join(out_dir, "explanations_test.csv"), index=False)
-        long_test.to_csv(os.path.join(out_dir, "explanations_test_long.csv"), index=False)
-        group_test.to_csv(os.path.join(out_dir, "explanations_test_by_group.csv"), index=False)
 
-        local_train, long_train, group_train = build_explanations_table(
-            R=result["R_train"],
-            response_names=result["response_names"],
-            scores=result["score_train"],
-            threshold=result["threshold"],
-            y_true=result["y_train"],
-            y_raw=y_raw[result["train_idx"]],
-            indices=result["train_idx"],
-            importance_df=imp,
-            top_k=explain_top_k,
-        )
-        local_train.to_csv(os.path.join(out_dir, "explanations_train.csv"), index=False)
-        long_train.to_csv(os.path.join(out_dir, "explanations_train_long.csv"), index=False)
-        group_train.to_csv(os.path.join(out_dir, "explanations_train_by_group.csv"), index=False)
+def nab_like_score(y_true: np.ndarray, y_pred: np.ndarray, fp_weight=0.22, fn_weight=1.0) -> Dict[str, float]:
+    gt_segments = mask_to_segments(y_true)
+    pred_segments = mask_to_segments(y_pred)
+    if len(gt_segments) == 0:
+        raw = -fp_weight * len(pred_segments)
+        return {"nab_like_score": float(raw), "nab_like_raw_score": float(raw),
+                "nab_like_gt_events": 0, "nab_like_pred_events": len(pred_segments),
+                "nab_like_tp_events": 0, "nab_like_fp_events": len(pred_segments), "nab_like_fn_events": 0}
+    score = 0.0; tp = 0; fn = 0; used = set()
+    for gi, (a, b) in enumerate(gt_segments):
+        best_reward, best_pi = None, None
+        for pi, (p, q) in enumerate(pred_segments):
+            if q < a or p > b:
+                continue
+            hit = max(p, a)
+            rel = (hit - a) / max((b - a + 1), 1)
+            reward = 2.0 * sigmoid(5.0 * (1.0 - rel)) - 1.0
+            if best_reward is None or reward > best_reward:
+                best_reward, best_pi = reward, pi
+        if best_reward is None:
+            score -= fn_weight; fn += 1
+        else:
+            score += best_reward; used.add(best_pi); tp += 1
+    fp = 0
+    for pi, (p, q) in enumerate(pred_segments):
+        if pi in used:
+            continue
+        if not any(not (q < a or p > b) for a, b in gt_segments):
+            score -= fp_weight; fp += 1
+    return {"nab_like_score": float(score / max(len(gt_segments), 1)), "nab_like_raw_score": float(score),
+            "nab_like_gt_events": len(gt_segments), "nab_like_pred_events": len(pred_segments),
+            "nab_like_tp_events": tp, "nab_like_fp_events": fp, "nab_like_fn_events": fn}
 
-        print("\nExample local explanations from TEST:")
-        show_cols = ["index", "y_raw", "y_true_binary", "prediction", "score", "top_features", "explanation"]
-        print(local_test.head(8)[show_cols].to_string(index=False))
 
-    except Exception as e:
-        print("Could not compute feature importance / explanations:", e)
+def evaluate_info(info: Dict, score: np.ndarray, pred: np.ndarray, args, out_dir: str) -> Dict[str, float]:
+    metrics = evaluate(info["y_window"], pred, score)
+    sparse = evaluate(info["y_sparse"], pred, score)
+    event = event_window_f1(info["y_window"], pred)
+    soft = soft_event_metrics(info["y_window"], pred)
+    nab = nab_like_score(info["y_window"], pred, args.nab_fp_weight, args.nab_fn_weight)
 
-    run_settings = {
-        "data_source": split_mode,
-        "normal_label": normal_label,
-        "test_size": test_size,
-        "seed": seed,
-        "output_directory": out_dir,
+    safe = info["series"].replace("/", "__").replace(".csv", "")
+    out_csv = os.path.join(out_dir, f"{safe}_supervised_scores.csv")
+    out = info["df"].copy()
+    out["label_window"] = info["y_window"]
+    out["label_sparse_point"] = info["y_sparse"]
+    out["score_supervised"] = score
+    out["prediction"] = pred
+    for j, name in enumerate(info["feature_names"]):
+        out[f"response_{name}"] = info["X"][:, j]
+    out.to_csv(out_csv, index=False)
+
+    row = {
+        "series": info["series"],
+        "category": info["category"],
+        "split": info["split"],
+        "n": len(info["df"]),
+        "train_end": info["train_end"],
+        "seasonal_period": int(info["meta"]["seasonal_period"]),
+        "out_csv": out_csv,
     }
-    with open(os.path.join(out_dir, "run_notes.json"), "w") as f:
-        json.dump(run_settings, f, indent=2)
+    row.update({f"window_{k}": v for k, v in metrics.items()})
+    row.update({f"sparse_{k}": v for k, v in sparse.items()})
+    row.update(event)
+    row.update(soft)
+    row.update(nab)
+    return row
 
-    print("\nSaved outputs in:", out_dir)
+
+def global_report(summary: pd.DataFrame, out_dir: str, name: str):
+    rows = []
+    with_anom = summary[summary["window_gt_ratio"] > 0]
+    no_anom = summary[summary["window_gt_ratio"] == 0]
+    rows.append({
+        "split": name,
+        "count": len(summary),
+        "mean_window_f1": summary["window_f1"].mean(),
+        "median_window_f1": summary["window_f1"].median(),
+        "mean_event_f1": summary["event_f1"].mean(),
+        "median_event_f1": summary["event_f1"].median(),
+        "mean_soft_event_f1": summary["soft_event_f1"].mean(),
+        "median_soft_event_f1": summary["soft_event_f1"].median(),
+        "mean_nab_like": summary["nab_like_score"].mean(),
+        "median_nab_like": summary["nab_like_score"].median(),
+        "no_anomaly_accuracy": (no_anom["window_pred_ratio"] == 0).mean() if len(no_anom) else np.nan,
+        "anomalous_mean_event_f1": with_anom["event_f1"].mean() if len(with_anom) else np.nan,
+    })
+    g = pd.DataFrame(rows)
+    g.to_csv(os.path.join(out_dir, f"global_scores_{name}.csv"), index=False)
+    cat = summary.groupby("category").agg(
+        count=("series", "count"),
+        mean_window_f1=("window_f1", "mean"),
+        mean_event_f1=("event_f1", "mean"),
+        mean_soft_event_f1=("soft_event_f1", "mean"),
+        mean_nab_like=("nab_like_score", "mean"),
+        mean_pred_ratio=("window_pred_ratio", "mean"),
+        mean_gt_ratio=("window_gt_ratio", "mean"),
+    ).reset_index()
+    cat.to_csv(os.path.join(out_dir, f"category_scores_{name}.csv"), index=False)
+    print(f"\nGLOBAL {name.upper()} SCORES")
+    print(g.to_string(index=False))
+    print(f"\nCATEGORY {name.upper()} SCORES")
+    print(cat.sort_values("mean_event_f1", ascending=False).to_string(index=False))
+
+
+def build_argparser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", type=str, default="/kaggle/input/datasets/mariapreda/nab-data/data")
+    parser.add_argument("--labels_path", type=str, default="/kaggle/input/datasets/mariapreda/nab-labels/labels")
+    parser.add_argument("--out_dir", type=str, default="./semantic_supervised_stratified_autotune_results")
+    parser.add_argument("--test_size", type=float, default=0.30)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--windows", type=parse_int_list, default=parse_int_list("8,16,32,64,128,256"))
+    parser.add_argument("--seasonal_periods", type=parse_int_list, default=parse_int_list("24,48,96,288,1440"))
+    parser.add_argument("--train_ratio", type=float, default=0.15)
+    parser.add_argument("--no_label_clean_train", action="store_true")
+    parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--no_log_preprocess", action="store_true")
+    parser.add_argument("--layer_smooth", type=float, default=1.0)
+    parser.add_argument("--score_smooth", type=float, default=2.0)
+
+    parser.add_argument("--aggregator", type=str, default="extra", choices=["logreg", "rf", "extra", "hgb"])
+    parser.add_argument("--n_estimators", type=int, default=400)
+    parser.add_argument("--max_depth", type=int, default=6)
+    parser.add_argument("--min_samples_leaf", type=int, default=20)
+    parser.add_argument("--learning_rate", type=float, default=0.05)
+    parser.add_argument("--logreg_C", type=float, default=1.0)
+    parser.add_argument("--max_points_per_series", type=int, default=5000)
+    parser.add_argument("--neg_pos_ratio", type=float, default=3.0)
+
+    parser.add_argument("--threshold_metric", type=str, default="balanced", choices=["balanced", "event_f1", "soft_event_f1", "nab_like", "window_f1"])
+    parser.add_argument("--thr_q_min", type=float, default=0.70)
+    parser.add_argument("--thr_q_max", type=float, default=0.995)
+    parser.add_argument("--thr_steps", type=int, default=60)
+    parser.add_argument("--verbose_thresholds", action="store_true")
+
+    parser.add_argument("--min_segment", type=int, default=8)
+    parser.add_argument("--close_gap", type=int, default=48)
+    parser.add_argument("--expand_radius", type=int, default=32)
+    parser.add_argument("--min_pred_ratio", type=float, default=0.0005)
+    parser.add_argument("--max_pred_ratio", type=float, default=0.20)
+    parser.add_argument("--nab_fp_weight", type=float, default=0.33)
+    parser.add_argument("--nab_fn_weight", type=float, default=1.0)
+
+    parser.add_argument("--auto_tune_postprocess", action="store_true", default=True)
+    parser.add_argument("--no_auto_tune_postprocess", dest="auto_tune_postprocess", action="store_false")
+    parser.add_argument("--autotune_max_combinations", type=int, default=48,
+                        help="Max random grid combinations to test. Use 0 for full grid.")
+    parser.add_argument("--grid_min_segment", type=str, default="8,16")
+    parser.add_argument("--grid_close_gap", type=str, default="16,32,48")
+    parser.add_argument("--grid_expand_radius", type=str, default="0,16,32")
+    parser.add_argument("--grid_max_pred_ratio", type=str, default="0.08,0.12,0.16,0.20")
+    parser.add_argument("--grid_min_pred_ratio", type=str, default="0.0,0.0005")
+    parser.add_argument("--grid_nab_fp_weight", type=str, default="0.33,0.50,0.75")
+
+    parser.add_argument("--obj_event_weight", type=float, default=0.35)
+    parser.add_argument("--obj_soft_weight", type=float, default=0.25)
+    parser.add_argument("--obj_nab_weight", type=float, default=0.30)
+    parser.add_argument("--obj_window_weight", type=float, default=0.10)
+    parser.add_argument("--obj_pred_ratio_penalty", type=float, default=0.25)
+    parser.add_argument("--target_max_pred_ratio", type=float, default=0.15)
+    return parser
+
+
+def main(args=None):
+    parser = build_argparser()
+    if args is None:
+        args, _ = parser.parse_known_args()
+    seed_everything(args.seed)
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    labels_all = load_label_json(args.labels_path, "combined_labels.json")
+    windows_all = load_label_json(args.labels_path, "combined_windows.json")
+    keys = [k for k in list_series(args.data_path) if k in labels_all and k in windows_all]
+    split_df = make_stratified_series_split(keys, windows_all, labels_all, args.test_size, args.seed)
+    split_df.to_csv(os.path.join(args.out_dir, "split_series.csv"), index=False)
+
+    print("DATA PATH:", args.data_path)
+    print("LABELS PATH:", args.labels_path)
+    print("SERIES COUNT:", len(keys))
+    print("AGGREGATOR:", args.aggregator)
+    print("SPLIT:")
+    print(split_df.groupby(["split", "category", "has_anom"]).size().to_string())
+
+    infos = []
+    for _, r in split_df.iterrows():
+        try:
+            info = build_response_table(args, r["series"], labels_all, windows_all, r["split"])
+            infos.append(info)
+            print(f"built {r['split']:5s} | {r['series']} | n={len(info['df'])} | gt={info['y_window'].mean():.4f}", flush=True)
+        except Exception as e:
+            print(f"[SKIP/ERROR] {r['series']}: {e}")
+
+    train_infos = [i for i in infos if i["split"] == "train"]
+    test_infos = [i for i in infos if i["split"] == "test"]
+
+    X_train, y_train, groups = sample_training_points(
+        train_infos,
+        max_points_per_series=args.max_points_per_series,
+        neg_pos_ratio=args.neg_pos_ratio,
+        seed=args.seed,
+    )
+    print("\nTRAIN AGGREGATOR DATA:", X_train.shape, "positive ratio:", y_train.mean())
+
+    model = make_model(args)
+    if args.aggregator == "hgb":
+        sw = compute_sample_weight(class_weight="balanced", y=y_train)
+        model.fit(X_train, y_train, sample_weight=sw)
+    else:
+        model.fit(X_train, y_train)
+
+    scores = {info["series"]: model_scores(model, info["X"]) for info in infos}
+
+    tuned_args, thr, selected = tune_postprocess_on_train(train_infos, scores, args)
+    with open(os.path.join(args.out_dir, "selected_hyperparams.json"), "w") as f:
+        json.dump(selected, f, indent=2)
+
+    rows_train, rows_test = [], []
+    for info in infos:
+        score = scores[info["series"]]
+        pred = postprocess_score(score, thr, tuned_args)
+        row = evaluate_info(info, score, pred, tuned_args, args.out_dir)
+        fmt = lambda d: {k: round(v, 4) if isinstance(v, float) and not np.isnan(v) else v for k, v in d.items()}
+        print(f"\n=== {info['split'].upper()} | {info['series']} ===")
+        print(f"n={len(info['df'])} | gt_ratio={info['y_window'].mean():.4f} | pred_ratio={pred.mean():.4f}")
+        print("WINDOW:", fmt({k.replace('window_', ''): v for k, v in row.items() if k.startswith('window_')}))
+        print("EVENT:", fmt({k: row[k] for k in ['event_precision','event_recall','event_f1','event_tp','event_fp','event_fn']}))
+        print("SOFT:", fmt({k: row[k] for k in ['soft_event_precision','soft_event_recall','soft_event_f1']}))
+        print("NAB-like:", fmt({k: row[k] for k in ['nab_like_score','nab_like_gt_events','nab_like_pred_events','nab_like_tp_events','nab_like_fp_events','nab_like_fn_events']}))
+        if info["split"] == "train":
+            rows_train.append(row)
+        else:
+            rows_test.append(row)
+
+    train_summary = pd.DataFrame(rows_train)
+    test_summary = pd.DataFrame(rows_test)
+    train_summary.to_csv(os.path.join(args.out_dir, "summary_train.csv"), index=False)
+    test_summary.to_csv(os.path.join(args.out_dir, "summary_test.csv"), index=False)
+
+    global_report(train_summary, args.out_dir, "train")
+    global_report(test_summary, args.out_dir, "test")
+
+    print("\nSaved outputs in:", args.out_dir)
 
 
 if __name__ == "__main__":
+    import sys
+    sys.argv = [
+        "semantic_multilayer_supervised_stratified_AUTOTUNE_nab.py",
+        "--data_path", "/kaggle/input/datasets/mariapreda/nab-data/data",
+        "--labels_path", "/kaggle/input/datasets/mariapreda/nab-labels/labels",
+        "--out_dir", "./semantic_supervised_stratified_autotune_results",
+        "--test_size", "0.30",
+        "--aggregator", "extra",
+        "--threshold_metric", "balanced",
+        "--auto_tune_postprocess",
+        "--grid_min_segment", "8,16",
+        "--grid_close_gap", "16,32,48",
+        "--grid_expand_radius", "0,16,32",
+        "--grid_max_pred_ratio", "0.08,0.12,0.16,0.20",
+        "--grid_min_pred_ratio", "0.0,0.0005",
+        "--grid_nab_fp_weight", "0.33,0.50,0.75",
+        "--autotune_max_combinations", "48",
+        "--thr_steps", "60",
+    ]
     main()

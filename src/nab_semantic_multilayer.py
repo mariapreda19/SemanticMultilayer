@@ -1,4 +1,4 @@
-import itertools
+import argparse
 import json
 import os
 import random
@@ -19,17 +19,10 @@ from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.utils.class_weight import compute_sample_weight
 
-try:
-    from tqdm.auto import tqdm
-except Exception:
-    def tqdm(x, **kwargs):
-        return x
-
 
 def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
-
 
 def _norm_key(path: str) -> str:
     return str(path).replace("\\", "/").lstrip("/")
@@ -115,7 +108,6 @@ def load_label_json(labels_path: str, filename: str) -> Dict:
                 return json.load(f)
     raise ValueError(f"labels_path must be folder or .zip: {labels_path}")
 
-
 def labels_to_sparse_point_mask(df: pd.DataFrame, label_times: List[str]) -> np.ndarray:
     label_ts = set(pd.to_datetime(label_times))
     return df["timestamp"].isin(label_ts).astype(int).to_numpy()
@@ -168,7 +160,6 @@ def robust_scale_signal(x_raw: np.ndarray, train_end: int, use_log: bool = True)
     x = np.asarray(x_raw, dtype=float)
     x = np.nan_to_num(x, nan=np.nanmedian(x), posinf=np.nanmedian(x), neginf=np.nanmedian(x))
 
-
     if use_log and np.nanmin(x) >= 0:
         q99 = np.nanquantile(x[:train_end], 0.99)
         q50 = np.nanquantile(x[:train_end], 0.50)
@@ -215,7 +206,6 @@ def choose_clean_train_prefix(y_window: np.ndarray, n: int, train_ratio: float, 
     if first > min_train:
         return min(default_end, first - 1)
     return default_end
-
 
 def rolling_stats(x: np.ndarray, w: int, causal: bool) -> Dict[str, np.ndarray]:
     s = pd.Series(x)
@@ -374,7 +364,6 @@ def build_semantic_layers(x_raw: np.ndarray, train_end: int, windows: List[int],
         add(f"flat_std_low_w{w}", np.median(feats["std"][:train_end]) - feats["std"])
         add(f"flat_range_low_w{w}", np.median(feats["range"][:train_end]) - feats["range"])
 
-
         train_med = np.median(feats["median"][:train_end])
         train_q10 = np.quantile(feats["median"][:train_end], 0.10)
         train_q90 = np.quantile(feats["median"][:train_end], 0.90)
@@ -442,21 +431,8 @@ def aggregate_modes(R: np.ndarray, names: List[str], train_end: int, score_smoot
     return hybrid, scores
 
 
-def build_response_table(
-    data_path: str,
-    series_key: str,
-    labels_all: Dict,
-    windows_all: Dict,
-    split_name: str,
-    windows: List[int],
-    seasonal_periods: List[int],
-    train_ratio: float,
-    foloseste_etichete_la_train: bool,
-    layer_smooth: float,
-    score_smooth: float,
-    causal: bool,
-    use_log_preprocess: bool):
-    df = load_csv(data_path, series_key)
+def build_response_table(args, series_key: str, labels_all: Dict, windows_all: Dict, split_name: str):
+    df = load_csv(args.data_path, series_key)
     x_raw = df["value"].to_numpy(dtype=float)
     y_sparse = labels_to_sparse_point_mask(df, labels_all[series_key])
     y_window = windows_to_point_mask(df, windows_all[series_key])
@@ -464,21 +440,21 @@ def build_response_table(
     train_end = choose_clean_train_prefix(
         y_window=y_window,
         n=len(df),
-        train_ratio=train_ratio,
-        min_train=max(windows),
-        use_labels=foloseste_etichete_la_train,
+        train_ratio=args.train_ratio,
+        min_train=max(args.windows),
+        use_labels=not args.no_label_clean_train,
     )
 
     R, layer_names, meta = build_semantic_layers(
         x_raw=x_raw,
         train_end=train_end,
-        windows=windows,
-        seasonal_periods=seasonal_periods,
-        layer_smooth=layer_smooth,
-        causal=causal,
-        use_log=use_log_preprocess,
+        windows=args.windows,
+        seasonal_periods=args.seasonal_periods,
+        layer_smooth=args.layer_smooth,
+        causal=args.causal,
+        use_log=not args.no_log_preprocess,
     )
-    hybrid, modes = aggregate_modes(R, layer_names, train_end, score_smooth)
+    hybrid, modes = aggregate_modes(R, layer_names, train_end, args.score_smooth)
 
     mode_names = ["hybrid", "all_peak", "up", "down", "flat", "level", "variance", "change", "frequency", "residual"]
     X_parts = []
@@ -492,7 +468,7 @@ def build_response_table(
     top3 = np.sort(R, axis=1)[:, -min(3, R.shape[1]):].mean(axis=1)
     top8 = np.sort(R, axis=1)[:, -min(8, R.shape[1]):].mean(axis=1)
     active = (R > 3.0).mean(axis=1)
-    X_parts += [top1.reshape(-1, 1), top3.reshape(-1, 1), top8.reshape(-1, 1), active.reshape(-1, 1)]
+    X_parts += [top1.reshape(-1,1), top3.reshape(-1,1), top8.reshape(-1,1), active.reshape(-1,1)]
     feature_names += ["layer_top1", "layer_top3", "layer_top8", "layer_active_frac"]
 
     X = np.column_stack(X_parts).astype(np.float32)
@@ -515,23 +491,19 @@ def build_response_table(
     }
     return info
 
-
 def make_stratified_series_split(keys: List[str], windows_all: Dict, labels_all: Dict, test_size: float, seed: int) -> pd.DataFrame:
     rows = []
     for k in keys:
         category = k.split("/")[0] if "/" in k else "unknown"
         has_anom = 1 if len(windows_all.get(k, [])) > 0 else 0
-
         rows.append({"series": k, "category": category, "has_anom": has_anom})
     df = pd.DataFrame(rows)
     df["stratum"] = df["category"] + "__" + df["has_anom"].astype(str)
 
     counts = df["stratum"].value_counts()
-
     df["stratum_safe"] = df["stratum"]
     rare = set(counts[counts < 2].index)
     df.loc[df["stratum_safe"].isin(rare), "stratum_safe"] = df.loc[df["stratum_safe"].isin(rare), "category"]
-
 
     counts2 = df["stratum_safe"].value_counts()
     rare2 = set(counts2[counts2 < 2].index)
@@ -542,7 +514,6 @@ def make_stratified_series_split(keys: List[str], windows_all: Dict, labels_all:
         splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
         train_idx, test_idx = next(splitter.split(df["series"], y))
     except Exception:
-
         splitter = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
         train_idx, test_idx = next(splitter.split(df["series"], df["category"]))
 
@@ -561,7 +532,6 @@ def sample_training_points(infos: List[Dict], max_points_per_series: int, neg_po
         pos_idx = np.where(y == 1)[0]
         neg_idx = np.where(y == 0)[0]
 
-
         if len(pos_idx) > max_points_per_series // 2:
             pos_idx = rng.choice(pos_idx, size=max_points_per_series // 2, replace=False)
         n_neg = int(max(len(pos_idx) * neg_pos_ratio, max_points_per_series // 3))
@@ -578,358 +548,110 @@ def sample_training_points(infos: List[Dict], max_points_per_series: int, neg_po
     return np.vstack(Xs), np.concatenate(ys).astype(int), np.array(groups)
 
 
-def make_model(
-    aggregator: str,
-    n_estimators: int,
-    max_depth: int,
-    min_samples_leaf: int,
-    learning_rate: float,
-    logreg_C: float,
-    seed: int):
-    if aggregator == "logreg":
+def make_model(args):
+    if args.aggregator == "logreg":
         return make_pipeline(
             StandardScaler(),
-            LogisticRegression(max_iter=2000, class_weight="balanced", C=logreg_C, random_state=seed)
+            LogisticRegression(max_iter=2000, class_weight="balanced", C=args.logreg_C, random_state=args.seed)
         )
-    if aggregator == "rf":
+    if args.aggregator == "rf":
         return RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_leaf=min_samples_leaf,
+            n_estimators=args.n_estimators,
+            max_depth=args.max_depth,
+            min_samples_leaf=args.min_samples_leaf,
             class_weight="balanced_subsample",
-            random_state=seed,
+            random_state=args.seed,
             n_jobs=-1,
         )
-    if aggregator == "extra":
+    if args.aggregator == "extra":
         return ExtraTreesClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_leaf=min_samples_leaf,
+            n_estimators=args.n_estimators,
+            max_depth=args.max_depth,
+            min_samples_leaf=args.min_samples_leaf,
             class_weight="balanced",
-            random_state=seed,
+            random_state=args.seed,
             n_jobs=-1,
         )
-    if aggregator == "hgb":
+    if args.aggregator == "hgb":
         return HistGradientBoostingClassifier(
-            max_iter=n_estimators,
-            learning_rate=learning_rate,
+            max_iter=args.n_estimators,
+            learning_rate=args.learning_rate,
             max_leaf_nodes=31,
             l2_regularization=0.1,
-            random_state=seed,
+            random_state=args.seed,
         )
-    raise ValueError(aggregator)
+    raise ValueError(args.aggregator)
 
 
 def model_scores(model, X: np.ndarray) -> np.ndarray:
     if hasattr(model, "predict_proba"):
         return model.predict_proba(X)[:, 1]
-
     return model.predict_proba(X)[:, 1]
 
 
-def parse_float_grid(s: str) -> List[float]:
-    return [float(x.strip()) for x in s.split(",") if x.strip()]
-
-
-def parse_int_grid(s: str) -> List[int]:
-    return [int(x.strip()) for x in s.split(",") if x.strip()]
-
-
-def train_metric_value(
-    y_true: np.ndarray,
-    pred: np.ndarray,
-    score: np.ndarray,
-    nab_fp_weight: float,
-    nab_fn_weight: float) -> Dict[str, float]:
-    win = evaluate(y_true, pred, score)
-    ev = event_window_f1(y_true, pred)
-    soft = soft_event_metrics(y_true, pred)
-    nab = nab_like_score(y_true, pred, nab_fp_weight, nab_fn_weight)
-    return {
-        "window_f1": win["f1"],
-        "event_f1": ev["event_f1"],
-        "soft_event_f1": soft["soft_event_f1"],
-        "nab_like": nab["nab_like_score"],
-        "pred_ratio": win["pred_ratio"],
-        "gt_ratio": win["gt_ratio"],
-        "event_fp": ev["event_fp"],
-        "event_fn": ev["event_fn"],
-    }
-
-
-def objective_from_metrics(
-    metrics: Dict[str, float],
-    threshold_metric: str,
-    obj_event_weight: float,
-    obj_soft_weight: float,
-    obj_nab_weight: float,
-    obj_window_weight: float,
-    obj_pred_ratio_penalty: float,
-    target_max_pred_ratio: float) -> float:
-    if threshold_metric == "event_f1":
-        return metrics["event_f1"]
-    if threshold_metric == "soft_event_f1":
-        return metrics["soft_event_f1"]
-    if threshold_metric == "nab_like":
-        return metrics["nab_like"]
-    if threshold_metric == "window_f1":
-        return metrics["window_f1"]
-
-    nab01 = (metrics["nab_like"] + 1.0) / 2.0
-    pred_penalty = max(0.0, metrics["pred_ratio"] - target_max_pred_ratio)
-    return (
-        obj_event_weight * metrics["event_f1"]
-        + obj_soft_weight * metrics["soft_event_f1"]
-        + obj_nab_weight * nab01
-        + obj_window_weight * metrics["window_f1"]
-        - obj_pred_ratio_penalty * pred_penalty
-    )
-
-def cap_by_top_components(score, pred, max_pred_ratio, min_segment=1):
-    score = np.asarray(score, dtype=float)
-    pred = np.asarray(pred, dtype=int).copy()
-
-    if max_pred_ratio is None or max_pred_ratio <= 0:
-        return clean_mask(pred, min_segment=min_segment)
-
-    max_points = int(len(pred) * max_pred_ratio)
-    if max_points <= 0:
-        return np.zeros_like(pred, dtype=int)
-
-    segments = mask_to_segments(pred)
-    if not segments:
-        return pred.astype(int)
-
-    segment_info = []
-    for start, end in segments:
-        length = end - start + 1
-        if length < min_segment:
-            continue
-
-        segment_score = float(np.mean(score[start:end + 1]))
-        segment_info.append((segment_score, start, end, length))
-
-    segment_info.sort(reverse=True, key=lambda x: x[0])
-
-    capped = np.zeros_like(pred, dtype=int)
-    used_points = 0
-
-    for _, start, end, length in segment_info:
-        if used_points + length > max_points:
-            continue
-
-        capped[start:end + 1] = 1
-        used_points += length
-
-        if used_points >= max_points:
-            break
-
-    return capped.astype(int)
-
-def postprocess_score(
-    score: np.ndarray,
-    thr: float,
-    min_segment: int,
-    close_gap: int,
-    expand_radius: int,
-    min_pred_ratio: float,
-    max_pred_ratio: float) -> np.ndarray:
-    raw = (score >= thr).astype(int)
-    pred = clean_mask(raw, min_segment=min_segment, close_gap=close_gap)
-    if pred.sum() > 0 and expand_radius > 0:
-        pred = expand_events(pred, expand_radius)
-        pred = clean_mask(pred, min_segment=min_segment, close_gap=close_gap)
-
-    if pred.mean() > max_pred_ratio:
-        pred = cap_by_top_components(score, pred, max_pred_ratio, min_segment)
-
-    if pred.mean() < min_pred_ratio:
-        pred[:] = 0
-    return pred.astype(int)
-
-
-def find_train_threshold(train_infos: List[Dict], train_scores: Dict[str, np.ndarray],
-        threshold_metric: str, thr_q_min: float, thr_q_max: float, thr_steps: int,
-        min_segment: int, close_gap: int, expand_radius: int, min_pred_ratio: float,
-        max_pred_ratio: float, nab_fp_weight: float, nab_fn_weight: float,
-        obj_event_weight: float, obj_soft_weight: float, obj_nab_weight: float,
-        obj_window_weight: float, obj_pred_ratio_penalty: float, target_max_pred_ratio: float,
-        verbose_thresholds: bool = False) -> float:
-
-    qs = np.linspace(thr_q_min, thr_q_max, thr_steps)
+def find_train_threshold(train_infos: List[Dict], train_scores: Dict[str, np.ndarray], args) -> float:
+    qs = np.linspace(args.thr_q_min, args.thr_q_max, args.thr_steps)
     all_scores = np.concatenate([train_scores[i["series"]] for i in train_infos])
     candidate_thr = np.unique(np.quantile(all_scores, qs))
 
-    best = (-1e18, candidate_thr[0])
+    best = (-1.0, candidate_thr[0])
     for thr in candidate_thr:
         vals = []
         for info in train_infos:
             score = train_scores[info["series"]]
-            pred = postprocess_score(score, thr, min_segment, close_gap, expand_radius, min_pred_ratio, max_pred_ratio)
-            m = train_metric_value(info["y_window"], pred, score, nab_fp_weight, nab_fn_weight)
-            vals.append(objective_from_metrics(
-                m, threshold_metric, obj_event_weight, obj_soft_weight, obj_nab_weight,
-                obj_window_weight, obj_pred_ratio_penalty, target_max_pred_ratio,
-            ))
-        obj = float(np.nanmean(vals))
-        if obj > best[0]:
-            best = (obj, float(thr))
-
-    if verbose_thresholds:
-        print(f"Selected threshold on TRAIN only: {best[1]:.6f} using {threshold_metric} objective={best[0]:.4f}", flush=True)
+            pred = postprocess_score(score, thr, args)
+            if args.threshold_metric == "event_f1":
+                vals.append(event_window_f1(info["y_window"], pred)["event_f1"])
+            elif args.threshold_metric == "soft_event_f1":
+                vals.append(soft_event_metrics(info["y_window"], pred)["soft_event_f1"])
+            elif args.threshold_metric == "nab_like":
+                vals.append(nab_like_score(info["y_window"], pred, args.nab_fp_weight, args.nab_fn_weight)["nab_like_score"])
+            else:
+                vals.append(evaluate(info["y_window"], pred, score)["f1"])
+        m = float(np.nanmean(vals))
+        if m > best[0]:
+            best = (m, float(thr))
+    print(f"Selected threshold on TRAIN only: {best[1]:.6f} using {args.threshold_metric}={best[0]:.4f}")
     return best[1]
 
 
-def tune_postprocess_on_train(
-    train_infos: List[Dict],
-    train_scores: Dict[str, np.ndarray],
-    seed: int,
-    threshold_metric: str,
-    thr_q_min: float,
-    thr_q_max: float,
-    thr_steps: int,
-    auto_tune_postprocess: bool,
-    autotune_max_combinations: int,
-    min_segment: int,
-    close_gap: int,
-    expand_radius: int,
-    min_pred_ratio: float,
-    max_pred_ratio: float,
-    nab_fp_weight: float,
-    nab_fn_weight: float,
-    grid_min_segment: str,
-    grid_close_gap: str,
-    grid_expand_radius: str,
-    grid_max_pred_ratio: str,
-    grid_min_pred_ratio: str,
-    grid_nab_fp_weight: str,
-    obj_event_weight: float,
-    obj_soft_weight: float,
-    obj_nab_weight: float,
-    obj_window_weight: float,
-    obj_pred_ratio_penalty: float,
-    target_max_pred_ratio: float,
-    verbose_thresholds: bool = False):
-    if not auto_tune_postprocess:
-        thr = find_train_threshold(
-            train_infos, train_scores, threshold_metric, thr_q_min, thr_q_max, thr_steps,
-            min_segment, close_gap, expand_radius, min_pred_ratio, max_pred_ratio,
-            nab_fp_weight, nab_fn_weight, obj_event_weight, obj_soft_weight, obj_nab_weight,
-            obj_window_weight, obj_pred_ratio_penalty, target_max_pred_ratio, verbose_thresholds,
-        )
-        selected_params = {
-            "min_segment": min_segment,
-            "close_gap": close_gap,
-            "expand_radius": expand_radius,
-            "min_pred_ratio": min_pred_ratio,
-            "max_pred_ratio": max_pred_ratio,
-            "nab_fp_weight": nab_fp_weight,
-            "nab_fn_weight": nab_fn_weight,
-        }
-        selected = {"auto_tune_postprocess": False, "threshold": float(thr), "threshold_metric": threshold_metric}
-        selected.update(selected_params)
-        return selected_params, thr, selected
+def postprocess_score(score: np.ndarray, thr: float, args) -> np.ndarray:
+    raw = (score >= thr).astype(int)
+    pred = clean_mask(raw, min_segment=args.min_segment, close_gap=args.close_gap)
+    if pred.sum() > 0 and args.expand_radius > 0:
+        pred = expand_events(pred, args.expand_radius)
+        pred = clean_mask(pred, min_segment=args.min_segment, close_gap=args.close_gap)
 
-    grid = list(itertools.product(
-        parse_int_grid(grid_min_segment),
-        parse_int_grid(grid_close_gap),
-        parse_int_grid(grid_expand_radius),
-        parse_float_grid(grid_max_pred_ratio),
-        parse_float_grid(grid_min_pred_ratio),
-        parse_float_grid(grid_nab_fp_weight),
-    ))
+    if pred.mean() > args.max_pred_ratio:
+        pred = cap_by_top_components(score, pred, args.max_pred_ratio, args.min_segment)
+    if pred.mean() < args.min_pred_ratio:
+        pred[:] = 0
+    return pred.astype(int)
 
-    original_grid_size = len(grid)
-    if autotune_max_combinations > 0 and len(grid) > autotune_max_combinations:
-        rng = np.random.default_rng(seed)
-        chosen = rng.choice(len(grid), size=autotune_max_combinations, replace=False)
-        grid = [grid[i] for i in chosen]
 
-    print(f"\nAUTOTUNE postprocess: testing {len(grid)} / {original_grid_size} combinations "
-          f"x {thr_steps} threshold quantiles on {len(train_infos)} train series", flush=True)
-
-    best = {"objective": -1e18}
-    best_thr = None
-    best_params = None
-
-    for combo_i, (cand_min_segment, cand_close_gap, cand_expand_radius, cand_max_pred_ratio,
-                  cand_min_pred_ratio, cand_nab_fp_weight) in enumerate(
-        tqdm(grid, desc="Autotune postprocess", unit="combo"), start=1
-    ):
-        thr = find_train_threshold(
-            train_infos, train_scores, threshold_metric, thr_q_min, thr_q_max, thr_steps,
-            cand_min_segment, cand_close_gap, cand_expand_radius, cand_min_pred_ratio, cand_max_pred_ratio,
-            cand_nab_fp_weight, nab_fn_weight, obj_event_weight, obj_soft_weight, obj_nab_weight,
-            obj_window_weight, obj_pred_ratio_penalty, target_max_pred_ratio, verbose_thresholds,
-        )
-
-        vals = []
-        debug = []
-        for info in train_infos:
-            score = train_scores[info["series"]]
-            pred = postprocess_score(
-                score, thr, cand_min_segment, cand_close_gap, cand_expand_radius,
-                cand_min_pred_ratio, cand_max_pred_ratio,
-            )
-            m = train_metric_value(info["y_window"], pred, score, cand_nab_fp_weight, nab_fn_weight)
-            vals.append(objective_from_metrics(
-                m, threshold_metric, obj_event_weight, obj_soft_weight, obj_nab_weight,
-                obj_window_weight, obj_pred_ratio_penalty, target_max_pred_ratio,
-            ))
-            debug.append(m)
-
-        obj = float(np.nanmean(vals))
-        mean_event = float(np.nanmean([d["event_f1"] for d in debug]))
-        mean_soft = float(np.nanmean([d["soft_event_f1"] for d in debug]))
-        mean_nab = float(np.nanmean([d["nab_like"] for d in debug]))
-        no_anom = [d for d in debug if d["gt_ratio"] == 0.0]
-        no_anom_acc = float(np.mean([d["pred_ratio"] == 0.0 for d in no_anom])) if no_anom else float("nan")
-
-        tie = (obj, mean_nab, mean_soft, no_anom_acc, -cand_max_pred_ratio, -cand_expand_radius, -cand_close_gap)
-        best_tie = best.get("tie", (-1e18,))
-        if tie > best_tie:
-            best = {
-                "objective": obj,
-                "tie": tie,
-                "threshold": float(thr),
-                "threshold_metric": threshold_metric,
-                "min_segment": int(cand_min_segment),
-                "close_gap": int(cand_close_gap),
-                "expand_radius": int(cand_expand_radius),
-                "max_pred_ratio": float(cand_max_pred_ratio),
-                "min_pred_ratio": float(cand_min_pred_ratio),
-                "nab_fp_weight": float(cand_nab_fp_weight),
-                "nab_fn_weight": float(nab_fn_weight),
-                "train_mean_event_f1": mean_event,
-                "train_mean_soft_event_f1": mean_soft,
-                "train_mean_nab_like": mean_nab,
-                "train_no_anomaly_accuracy": no_anom_acc,
-                "grid_size": len(grid),
-            }
-            best_params = {
-                "min_segment": int(cand_min_segment),
-                "close_gap": int(cand_close_gap),
-                "expand_radius": int(cand_expand_radius),
-                "min_pred_ratio": float(cand_min_pred_ratio),
-                "max_pred_ratio": float(cand_max_pred_ratio),
-                "nab_fp_weight": float(cand_nab_fp_weight),
-                "nab_fn_weight": float(nab_fn_weight),
-            }
-            best_thr = thr
-            print(
-                f"[new best {combo_i}/{len(grid)}] obj={obj:.4f} "
-                f"event={mean_event:.4f} soft={mean_soft:.4f} nab={mean_nab:.4f} "
-                f"noanom={no_anom_acc:.3f} thr={thr:.4f} "
-                f"minseg={cand_min_segment} close={cand_close_gap} expand={cand_expand_radius} "
-                f"maxratio={cand_max_pred_ratio} fpw={cand_nab_fp_weight}",
-                flush=True,
-            )
-
-    print("\nSELECTED POSTPROCESSING ON TRAIN ONLY")
-    for k, v in best.items():
-        if k != "tie":
-            print(f"  {k}: {v}")
-    return best_params, best_thr, best
+def cap_by_top_components(score: np.ndarray, mask: np.ndarray, max_ratio: float, min_segment: int) -> np.ndarray:
+    n = len(mask)
+    cap = max(min_segment, int(round(n * max_ratio)))
+    segs = mask_to_segments(mask)
+    if not segs or mask.sum() <= cap:
+        return mask.astype(int)
+    ranked = []
+    for a, b in segs:
+        length = b - a + 1
+        mass = float(np.sum(score[a:b+1]))
+        peak = float(np.max(score[a:b+1]))
+        ranked.append((mass / np.sqrt(length) + 0.1 * peak, a, b, length))
+    ranked.sort(reverse=True)
+    out = np.zeros(n, dtype=int)
+    used = 0
+    for _, a, b, length in ranked:
+        if used + length > cap and used > 0:
+            continue
+        out[a:b+1] = 1
+        used += length
+        if used >= cap:
+            break
+    return clean_mask(out, min_segment=min_segment, close_gap=0)
 
 
 def safe_auc(y_true: np.ndarray, score: np.ndarray) -> Tuple[float, float]:
@@ -1037,13 +759,12 @@ def nab_like_score(y_true: np.ndarray, y_pred: np.ndarray, fp_weight=0.22, fn_we
             "nab_like_tp_events": tp, "nab_like_fp_events": fp, "nab_like_fn_events": fn}
 
 
-def evaluate_info(info: Dict, score: np.ndarray, pred: np.ndarray, out_dir: str,
-                    nab_fp_weight: float, nab_fn_weight: float) -> Dict[str, float]:
+def evaluate_info(info: Dict, score: np.ndarray, pred: np.ndarray, args, out_dir: str) -> Dict[str, float]:
     metrics = evaluate(info["y_window"], pred, score)
     sparse = evaluate(info["y_sparse"], pred, score)
     event = event_window_f1(info["y_window"], pred)
     soft = soft_event_metrics(info["y_window"], pred)
-    nab = nab_like_score(info["y_window"], pred, nab_fp_weight, nab_fn_weight)
+    nab = nab_like_score(info["y_window"], pred, args.nab_fp_weight, args.nab_fn_weight)
 
     safe = info["series"].replace("/", "__").replace(".csv", "")
     out_csv = os.path.join(out_dir, f"{safe}_supervised_scores.csv")
@@ -1109,100 +830,73 @@ def global_report(summary: pd.DataFrame, out_dir: str, name: str):
     print(cat.sort_values("mean_event_f1", ascending=False).to_string(index=False))
 
 
-def main():
-    seed = 42
-    seed_everything(seed)
+def build_argparser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", type=str, default="/kaggle/input/datasets/mariapreda/nab-data/data")
+    parser.add_argument("--labels_path", type=str, default="/kaggle/input/datasets/mariapreda/nab-labels/labels")
+    parser.add_argument("--out_dir", type=str, default="./semantic_supervised_stratified_results")
+    parser.add_argument("--test_size", type=float, default=0.30)
+    parser.add_argument("--seed", type=int, default=42)
 
-    data_path = "/kaggle/input/datasets/mariapreda/nab-data/data"
-    labels_path = "/kaggle/input/datasets/mariapreda/nab-labels/labels"
-    out_dir = "./semantic_supervised_stratified_autotune_results"
-    os.makedirs(out_dir, exist_ok=True)
+    parser.add_argument("--windows", type=parse_int_list, default=parse_int_list("8,16,32,64,128,256"))
+    parser.add_argument("--seasonal_periods", type=parse_int_list, default=parse_int_list("24,48,96,288,1440"))
+    parser.add_argument("--train_ratio", type=float, default=0.15)
+    parser.add_argument("--no_label_clean_train", action="store_true")
+    parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--no_log_preprocess", action="store_true")
+    parser.add_argument("--layer_smooth", type=float, default=1.0)
+    parser.add_argument("--score_smooth", type=float, default=2.0)
 
-    test_size = 0.30
+    parser.add_argument("--aggregator", type=str, default="extra", choices=["logreg", "rf", "extra", "hgb"])
+    parser.add_argument("--n_estimators", type=int, default=400)
+    parser.add_argument("--max_depth", type=int, default=6)
+    parser.add_argument("--min_samples_leaf", type=int, default=20)
+    parser.add_argument("--learning_rate", type=float, default=0.05)
+    parser.add_argument("--logreg_C", type=float, default=1.0)
+    parser.add_argument("--max_points_per_series", type=int, default=5000)
+    parser.add_argument("--neg_pos_ratio", type=float, default=3.0)
 
-    windows = [8, 16, 32, 64, 128, 256]
-    seasonal_periods = [24, 48, 96, 288, 1440]
-    train_ratio = 0.15
-    foloseste_etichete_la_train = True
-    causal = False
-    use_log_preprocess = True
-    layer_smooth = 1.0
-    score_smooth = 2.0
+    parser.add_argument("--threshold_metric", type=str, default="event_f1", choices=["event_f1", "soft_event_f1", "nab_like", "window_f1"])
+    parser.add_argument("--thr_q_min", type=float, default=0.70)
+    parser.add_argument("--thr_q_max", type=float, default=0.995)
+    parser.add_argument("--thr_steps", type=int, default=120)
 
-    aggregator = "extra"
-    n_estimators = 400
-    max_depth = 6
-    min_samples_leaf = 20
-    learning_rate = 0.05
-    logreg_C = 1.0
+    parser.add_argument("--min_segment", type=int, default=8)
+    parser.add_argument("--close_gap", type=int, default=48)
+    parser.add_argument("--expand_radius", type=int, default=32)
+    parser.add_argument("--min_pred_ratio", type=float, default=0.0005)
+    parser.add_argument("--max_pred_ratio", type=float, default=0.20)
+    parser.add_argument("--nab_fp_weight", type=float, default=0.33)
+    parser.add_argument("--nab_fn_weight", type=float, default=1.0)
+    return parser
 
-    max_points_per_series = 5000
-    neg_pos_ratio = 3.0
 
-    threshold_metric = "balanced"
-    thr_q_min = 0.70
-    thr_q_max = 0.995
-    thr_steps = 60
-    verbose_thresholds = False
+def main(args=None):
+    parser = build_argparser()
+    if args is None:
+        args, _ = parser.parse_known_args()
+    seed_everything(args.seed)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    min_segment = 8
-    close_gap = 48
-    expand_radius = 32
-    min_pred_ratio = 0.0005
-    max_pred_ratio = 0.20
-    nab_fp_weight = 0.33
-    nab_fn_weight = 1.0
+    labels_all = load_label_json(args.labels_path, "combined_labels.json")
+    windows_all = load_label_json(args.labels_path, "combined_windows.json")
+    keys = [k for k in list_series(args.data_path) if k in labels_all and k in windows_all]
+    split_df = make_stratified_series_split(keys, windows_all, labels_all, args.test_size, args.seed)
+    split_df.to_csv(os.path.join(args.out_dir, "split_series.csv"), index=False)
 
-    auto_tune_postprocess = True
-    autotune_max_combinations = 48
-    grid_min_segment = "8,16"
-    grid_close_gap = "16,32,48"
-    grid_expand_radius = "0,16,32"
-    grid_max_pred_ratio = "0.08,0.12,0.16,0.20"
-    grid_min_pred_ratio = "0.0,0.0005"
-    grid_nab_fp_weight = "0.33,0.50,0.75"
-
-    obj_event_weight = 0.35
-    obj_soft_weight = 0.25
-    obj_nab_weight = 0.30
-    obj_window_weight = 0.10
-    obj_pred_ratio_penalty = 0.25
-    target_max_pred_ratio = 0.15
-
-    labels_all = load_label_json(labels_path, "combined_labels.json")
-    windows_all = load_label_json(labels_path, "combined_windows.json")
-    keys = [k for k in list_series(data_path) if k in labels_all and k in windows_all]
-
-    split_df = make_stratified_series_split(keys, windows_all, labels_all, test_size, seed)
-    split_df.to_csv(os.path.join(out_dir, "split_series.csv"), index=False)
-
-    print("DATA PATH:", data_path)
-    print("LABELS PATH:", labels_path)
+    print("DATA PATH:", args.data_path)
+    print("LABELS PATH:", args.labels_path)
     print("SERIES COUNT:", len(keys))
-    print("AGGREGATOR:", aggregator)
+    print("AGGREGATOR:", args.aggregator)
     print("SPLIT:")
     print(split_df.groupby(["split", "category", "has_anom"]).size().to_string())
 
     infos = []
     for _, r in split_df.iterrows():
         try:
-            info = build_response_table(
-                data_path=data_path,
-                series_key=r["series"],
-                labels_all=labels_all,
-                windows_all=windows_all,
-                split_name=r["split"],
-                windows=windows,
-                seasonal_periods=seasonal_periods,
-                train_ratio=train_ratio,
-                foloseste_etichete_la_train=foloseste_etichete_la_train,
-                layer_smooth=layer_smooth,
-                score_smooth=score_smooth,
-                causal=causal,
-                use_log_preprocess=use_log_preprocess,
-            )
+            info = build_response_table(args, r["series"], labels_all, windows_all, r["split"])
             infos.append(info)
-            print(f"built {r['split']:5s} | {r['series']} | n={len(info['df'])} | gt={info['y_window'].mean():.4f}", flush=True)
+            print(f"built {r['split']:5s} | {r['series']} | n={len(info['df'])} | gt={info['y_window'].mean():.4f}")
         except Exception as e:
             print(f"[SKIP/ERROR] {r['series']}: {e}")
 
@@ -1211,22 +905,14 @@ def main():
 
     X_train, y_train, groups = sample_training_points(
         train_infos,
-        max_points_per_series=max_points_per_series,
-        neg_pos_ratio=neg_pos_ratio,
-        seed=seed,
+        max_points_per_series=args.max_points_per_series,
+        neg_pos_ratio=args.neg_pos_ratio,
+        seed=args.seed,
     )
     print("\nTRAIN AGGREGATOR DATA:", X_train.shape, "positive ratio:", y_train.mean())
 
-    model = make_model(
-        aggregator=aggregator,
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        min_samples_leaf=min_samples_leaf,
-        learning_rate=learning_rate,
-        logreg_C=logreg_C,
-        seed=seed,
-    )
-    if aggregator == "hgb":
+    model = make_model(args)
+    if args.aggregator == "hgb":
         sw = compute_sample_weight(class_weight="balanced", y=y_train)
         model.fit(X_train, y_train, sample_weight=sw)
     else:
@@ -1234,53 +920,15 @@ def main():
 
     scores = {info["series"]: model_scores(model, info["X"]) for info in infos}
 
-    selected_params, thr, selected = tune_postprocess_on_train(
-        train_infos=train_infos,
-        train_scores=scores,
-        seed=seed,
-        threshold_metric=threshold_metric,
-        thr_q_min=thr_q_min,
-        thr_q_max=thr_q_max,
-        thr_steps=thr_steps,
-        auto_tune_postprocess=auto_tune_postprocess,
-        autotune_max_combinations=autotune_max_combinations,
-        min_segment=min_segment,
-        close_gap=close_gap,
-        expand_radius=expand_radius,
-        min_pred_ratio=min_pred_ratio,
-        max_pred_ratio=max_pred_ratio,
-        nab_fp_weight=nab_fp_weight,
-        nab_fn_weight=nab_fn_weight,
-        grid_min_segment=grid_min_segment,
-        grid_close_gap=grid_close_gap,
-        grid_expand_radius=grid_expand_radius,
-        grid_max_pred_ratio=grid_max_pred_ratio,
-        grid_min_pred_ratio=grid_min_pred_ratio,
-        grid_nab_fp_weight=grid_nab_fp_weight,
-        obj_event_weight=obj_event_weight,
-        obj_soft_weight=obj_soft_weight,
-        obj_nab_weight=obj_nab_weight,
-        obj_window_weight=obj_window_weight,
-        obj_pred_ratio_penalty=obj_pred_ratio_penalty,
-        target_max_pred_ratio=target_max_pred_ratio,
-        verbose_thresholds=verbose_thresholds,
-    )
-    with open(os.path.join(out_dir, "selected_hyperparams.json"), "w") as f:
-        json.dump(selected, f, indent=2)
-
-    min_segment = selected_params["min_segment"]
-    close_gap = selected_params["close_gap"]
-    expand_radius = selected_params["expand_radius"]
-    min_pred_ratio = selected_params["min_pred_ratio"]
-    max_pred_ratio = selected_params["max_pred_ratio"]
-    nab_fp_weight = selected_params["nab_fp_weight"]
-    nab_fn_weight = selected_params["nab_fn_weight"]
+    thr = find_train_threshold(train_infos, scores, args)
+    with open(os.path.join(args.out_dir, "selected_threshold.json"), "w") as f:
+        json.dump({"threshold": float(thr), "metric": args.threshold_metric}, f, indent=2)
 
     rows_train, rows_test = [], []
     for info in infos:
         score = scores[info["series"]]
-        pred = postprocess_score(score, thr, min_segment, close_gap, expand_radius, min_pred_ratio, max_pred_ratio)
-        row = evaluate_info(info, score, pred, out_dir, nab_fp_weight, nab_fn_weight)
+        pred = postprocess_score(score, thr, args)
+        row = evaluate_info(info, score, pred, args, args.out_dir)
         fmt = lambda d: {k: round(v, 4) if isinstance(v, float) and not np.isnan(v) else v for k, v in d.items()}
         print(f"\n=== {info['split'].upper()} | {info['series']} ===")
         print(f"n={len(info['df'])} | gt_ratio={info['y_window'].mean():.4f} | pred_ratio={pred.mean():.4f}")
@@ -1295,14 +943,29 @@ def main():
 
     train_summary = pd.DataFrame(rows_train)
     test_summary = pd.DataFrame(rows_test)
-    train_summary.to_csv(os.path.join(out_dir, "summary_train.csv"), index=False)
-    test_summary.to_csv(os.path.join(out_dir, "summary_test.csv"), index=False)
+    train_summary.to_csv(os.path.join(args.out_dir, "summary_train.csv"), index=False)
+    test_summary.to_csv(os.path.join(args.out_dir, "summary_test.csv"), index=False)
 
-    global_report(train_summary, out_dir, "train")
-    global_report(test_summary, out_dir, "test")
+    global_report(train_summary, args.out_dir, "train")
+    global_report(test_summary, args.out_dir, "test")
 
-    print("\nSaved outputs in:", out_dir)
+    print("\nSaved outputs in:", args.out_dir)
 
 
 if __name__ == "__main__":
+    import sys
+    sys.argv = [
+        "semantic_multilayer_supervised_stratified_nab.py",
+        "--data_path", "/kaggle/input/datasets/mariapreda/nab-data/data",
+        "--labels_path", "/kaggle/input/datasets/mariapreda/nab-labels/labels",
+        "--out_dir", "./semantic_supervised_stratified_results",
+        "--test_size", "0.30",
+        "--aggregator", "extra",
+        "--threshold_metric", "event_f1",
+        "--min_segment", "8",
+        "--close_gap", "48",
+        "--expand_radius", "32",
+        "--max_pred_ratio", "0.20",
+        "--nab_fp_weight", "0.33",
+    ]
     main()
